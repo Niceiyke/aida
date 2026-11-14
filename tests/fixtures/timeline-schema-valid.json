@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "1.0.0",
+  "projectId": "018f2e40-4d28-7e31-8b63-611d49c43b0a",
+  "revision": 0,
+  "canvas": {
+    "width": 640,
+    "height": 360,
+    "fps": { "num": 24, "den": 1 },
+    "background": "#101820"
+  },
+  "assets": {
+    "018f2e40-4d28-7e31-8b63-611d49c43b0b": {
+      "kind": "video",
+      "uri": "asset://018f2e40-4d28-7e31-8b63-611d49c43b0b",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "tracks": [
+    {
+      "id": "video-main",
+      "kind": "video",
+      "order": 0,
+      "clips": [
+        {
+          "id": "clip-1",
+          "kind": "video",
+          "assetId": "018f2e40-4d28-7e31-8b63-611d49c43b0b",
+          "startFrame": 0,
+          "durationFrames": 24,
+          "sourceIn": { "ticks": 0, "timebase_num": 1, "timebase_den": 24 },
+          "sourceOut": { "ticks": 24, "timebase_num": 1, "timebase_den": 24 }
+        }
+      ]
+    }
+  ]
+}

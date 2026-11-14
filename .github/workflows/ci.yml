@@ -1,0 +1,43 @@
+name: Rust checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  headless:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install headless media dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg fonts-dejavu-core
+      - name: Install headless media dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ffmpeg --yes --no-progress
+          $ffmpeg = Get-ChildItem "$env:ProgramData\chocolatey\lib\ffmpeg" -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          if (-not $ffmpeg) { throw 'Could not locate installed ffmpeg.exe' }
+          $bin = Split-Path $ffmpeg.FullName
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          $env:PATH = "$bin;$env:PATH"
+          ffmpeg -version
+          ffprobe -version
+        shell: pwsh
+      - name: Verify FFmpeg tools are available
+        run: ffmpeg -version && ffprobe -version
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run unit and FFmpeg integration tests
+        run: cargo test
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings

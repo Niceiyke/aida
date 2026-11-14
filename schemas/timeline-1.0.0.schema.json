@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://avida.local/schemas/timeline-1.0.0.schema.json",
+  "title": "Avida timeline 1.0.0",
+  "description": "Machine-readable timeline shape for the first local CLI release. Semantic checks additionally validate asset references, source duration, track layout and renderer support.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "projectId", "revision", "canvas", "assets", "tracks"],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "projectId": { "$ref": "#/$defs/uuid" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "canvas": { "$ref": "#/$defs/canvas" },
+    "assets": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 100,
+      "propertyNames": { "$ref": "#/$defs/uuid" },
+      "additionalProperties": { "$ref": "#/$defs/asset" }
+    },
+    "tracks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/track" }
+    },
+    "settings": { "$ref": "#/$defs/settings" }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[47][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "color": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "fps", "background"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 2, "maximum": 1920, "multipleOf": 2 },
+        "height": { "type": "integer", "minimum": 2, "maximum": 1920, "multipleOf": 2 },
+        "fps": {
+          "oneOf": [
+            { "type": "object", "additionalProperties": false, "required": ["num", "den"], "properties": { "num": { "const": 24 }, "den": { "const": 1 } } },
+            { "type": "object", "additionalProperties": false, "required": ["num", "den"], "properties": { "num": { "const": 25 }, "den": { "const": 1 } } },
+            { "type": "object", "additionalProperties": false, "required": ["num", "den"], "properties": { "num": { "const": 30 }, "den": { "const": 1 } } },
+            { "type": "object", "additionalProperties": false, "required": ["num", "den"], "properties": { "num": { "const": 30000 }, "den": { "const": 1001 } } }
+          ]
+        },
+        "background": { "$ref": "#/$defs/color" }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "uri", "sha256"],
+      "properties": {
+        "kind": { "enum": ["video", "audio"] },
+        "uri": { "type": "string", "pattern": "^asset://[0-9a-fA-F-]{36}$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
+      }
+    },
+    "track": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "order"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["video", "audio", "overlay", "caption"] },
+        "order": { "type": "integer" },
+        "enabled": { "type": "boolean", "default": true },
+        "locked": { "type": "boolean", "default": false },
+        "clips": { "type": "array", "maxItems": 500, "items": { "$ref": "#/$defs/clip" } }
+      }
+    },
+    "clip": {
+      "oneOf": [
+        { "$ref": "#/$defs/videoClip" },
+        { "$ref": "#/$defs/audioClip" },
+        { "$ref": "#/$defs/textClip" },
+        { "$ref": "#/$defs/captionClip" },
+        { "$ref": "#/$defs/imageClip" }
+      ]
+    },
+    "clipBase": {
+      "type": "object",
+      "required": ["id", "kind", "startFrame", "durationFrames"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "startFrame": { "type": "integer", "minimum": 0 },
+        "durationFrames": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "sourceTimestamp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ticks", "timebase_num", "timebase_den"],
+      "properties": {
+        "ticks": { "type": "integer", "minimum": 0 },
+        "timebase_num": { "type": "integer", "minimum": 1 },
+        "timebase_den": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "transform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "scaleX", "scaleY", "rotationDeg", "opacity"],
+      "properties": {
+        "x": { "type": "number" }, "y": { "type": "number" },
+        "scaleX": { "type": "number", "exclusiveMinimum": 0 },
+        "scaleY": { "type": "number", "exclusiveMinimum": 0 },
+        "rotationDeg": { "type": "number" },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "videoClip": {
+      "allOf": [
+        { "$ref": "#/$defs/clipBase" },
+        {
+          "type": "object",
+          "required": ["assetId", "sourceIn", "sourceOut"],
+          "properties": {
+            "kind": { "const": "video" }, "assetId": { "$ref": "#/$defs/uuid" },
+            "sourceIn": { "$ref": "#/$defs/sourceTimestamp" }, "sourceOut": { "$ref": "#/$defs/sourceTimestamp" },
+            "transform": { "$ref": "#/$defs/transform" },
+            "effects": { "type": "array", "maxItems": 0 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "audioClip": {
+      "allOf": [
+        { "$ref": "#/$defs/clipBase" },
+        {
+          "type": "object",
+          "required": ["assetId", "sourceIn", "sourceOut"],
+          "properties": {
+            "kind": { "const": "audio" }, "assetId": { "$ref": "#/$defs/uuid" },
+            "sourceIn": { "$ref": "#/$defs/sourceTimestamp" }, "sourceOut": { "$ref": "#/$defs/sourceTimestamp" },
+            "gain": { "type": "number", "minimum": 0, "maximum": 4, "default": 1 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "textClip": {
+      "allOf": [
+        { "$ref": "#/$defs/clipBase" },
+        {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "kind": { "const": "text" }, "text": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "fontSize": { "type": "integer", "minimum": 1, "maximum": 256, "default": 48 },
+            "color": { "$ref": "#/$defs/color", "default": "#FFFFFF" },
+            "x": { "type": "integer", "minimum": 0, "default": 0 }, "y": { "type": "integer", "minimum": 0, "default": 80 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "captionClip": {
+      "allOf": [
+        { "$ref": "#/$defs/clipBase" },
+        { "type": "object", "required": ["text"], "properties": { "kind": { "const": "caption" }, "text": { "type": "string", "minLength": 1, "maxLength": 4096 } } }
+      ],
+      "unevaluatedProperties": false
+    },
+    "imageClip": {
+      "allOf": [
+        { "$ref": "#/$defs/clipBase" },
+        { "type": "object", "required": ["assetId"], "properties": { "kind": { "const": "image" }, "assetId": { "$ref": "#/$defs/uuid" } } }
+      ],
+      "unevaluatedProperties": false
+    },
+    "settings": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "audioSampleRate": { "const": 48000, "default": 48000 },
+        "colorSpace": { "const": "rec709" },
+        "exportPreset": { "enum": ["landscape_720p30", "landscape_1080p30", "vertical_1080p30", "square_1080p30"] }
+      }
+    }
+  }
+}
