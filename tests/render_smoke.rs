@@ -253,8 +253,10 @@ fn imports_validates_and_renders_a_small_timeline() {
     assert!(decoded_audio.status.success());
     let first_audible_sample = decoded_audio
         .stdout
-        .chunks_exact(2)
-        .position(|bytes| i32::from(i16::from_le_bytes([bytes[0], bytes[1]])).abs() > 100)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .position(|bytes| i32::from(i16::from_le_bytes(*bytes)).abs() > 100)
         .expect("render should contain audible samples");
     let expected_onset = 48_000_usize;
     let one_frame_samples = 48_000_usize / 24;
