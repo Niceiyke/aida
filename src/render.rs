@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -12,8 +13,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    media::{MediaProbe, probe_media},
-    process::run_checked,
+    media::{MediaProbe, probe_media_cancellable},
+    process::run_checked_cancellable,
     timeline::{
         Clip, FrameRate, ResolvedAsset, ValidatedTimeline, VideoClip, frame_boundary_sample,
         load_and_validate,
@@ -23,6 +24,62 @@ use crate::{
 
 const MAX_FONT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const PREVIEW_MAX_EDGE: u32 = 640;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderPreset {
+    Export,
+    Preview,
+}
+
+impl RenderPreset {
+    pub(crate) fn parse(id: &str) -> Result<Self> {
+        match id {
+            "export" => Ok(Self::Export),
+            "preview" => Ok(Self::Preview),
+            _ => bail!("VALIDATION_FAILED: presetId must be export or preview"),
+        }
+    }
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Preview => "preview",
+        }
+    }
+
+    fn output_dimensions(self, width: u32, height: u32) -> (u32, u32) {
+        if self == Self::Export || width.max(height) <= PREVIEW_MAX_EDGE {
+            return (width, height);
+        }
+
+        if width >= height {
+            (
+                PREVIEW_MAX_EDGE,
+                scaled_even_dimension(height, PREVIEW_MAX_EDGE, width),
+            )
+        } else {
+            (
+                scaled_even_dimension(width, PREVIEW_MAX_EDGE, height),
+                PREVIEW_MAX_EDGE,
+            )
+        }
+    }
+
+    fn encoder_settings(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Export => ("medium", "20"),
+            Self::Preview => ("veryfast", "28"),
+        }
+    }
+}
+
+fn scaled_even_dimension(dimension: u32, target_major: u32, source_major: u32) -> u32 {
+    let numerator = u64::from(dimension) * u64::from(target_major);
+    let denominator = u64::from(source_major);
+    let nearest_even = ((numerator + denominator) / (2 * denominator)) * 2;
+    u32::try_from(nearest_even.max(2)).unwrap_or(2)
+}
 
 pub struct RenderOptions {
     pub workspace: PathBuf,
@@ -34,7 +91,7 @@ pub struct RenderOptions {
     pub timeout_seconds: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderResult {
     pub output: PathBuf,
@@ -72,6 +129,7 @@ struct Provenance<'a> {
     audio_encoder: Option<&'static str>,
     output_sha256: &'a str,
     output_preset: &'a str,
+    render_preset: &'a str,
 }
 
 #[derive(Serialize)]
@@ -82,9 +140,25 @@ struct ProvenanceAsset<'a> {
 }
 
 pub fn render_timeline(options: RenderOptions) -> Result<RenderResult> {
+    render_timeline_cancellable(options, None)
+}
+
+pub(crate) fn render_timeline_cancellable(
+    options: RenderOptions,
+    cancellation: Option<std::sync::Arc<AtomicBool>>,
+) -> Result<RenderResult> {
+    render_timeline_with_preset_cancellable(options, RenderPreset::Export, cancellation)
+}
+
+pub(crate) fn render_timeline_with_preset_cancellable(
+    options: RenderOptions,
+    preset: RenderPreset,
+    cancellation: Option<std::sync::Arc<AtomicBool>>,
+) -> Result<RenderResult> {
     if !(1..=3600).contains(&options.timeout_seconds) {
         bail!("timeout-seconds must be between 1 and 3600");
     }
+    ensure_not_cancelled(cancellation.as_deref())?;
     let timeout = Duration::from_secs(options.timeout_seconds);
     let workspace = Workspace::open(&options.workspace)?;
     let validated = load_and_validate(&options.timeline, &workspace)?;
@@ -109,7 +183,7 @@ pub fn render_timeline(options: RenderOptions) -> Result<RenderResult> {
         &work_dir,
         !validated.text_clips.is_empty(),
     )?;
-    let plan = build_render_plan(&validated)?;
+    let plan = build_render_plan(&validated, preset)?;
     let filter_graph = compile_filter_graph(&plan, &work_dir, font.as_ref())?;
     let command_budget = filter_graph.len()
         + plan
@@ -122,8 +196,8 @@ pub fn render_timeline(options: RenderOptions) -> Result<RenderResult> {
         bail!("generated FFmpeg command exceeds the supported 28 KiB command limit");
     }
 
-    let ffmpeg = tool_identity(&options.ffmpeg, timeout)?;
-    let ffprobe = tool_identity(&options.ffprobe, timeout)?;
+    let ffmpeg = tool_identity(&options.ffmpeg, timeout, cancellation.as_deref())?;
+    let ffprobe = tool_identity(&options.ffprobe, timeout, cancellation.as_deref())?;
     run_ffmpeg(FfmpegInvocation {
         executable: &options.ffmpeg,
         inputs: &plan.inputs,
@@ -132,16 +206,26 @@ pub fn render_timeline(options: RenderOptions) -> Result<RenderResult> {
         output: &output_temp,
         frames: plan.total_frames,
         has_audio: !plan.audio_clips.is_empty(),
+        preset,
         timeout,
+        cancellation: cancellation.as_deref(),
     })?;
+    ensure_not_cancelled(cancellation.as_deref())?;
 
     let output_metadata = fs::metadata(&output_temp).context("FFmpeg did not create an output")?;
     if output_metadata.len() == 0 || output_metadata.len() > MAX_OUTPUT_BYTES {
         bail!("render output is empty or exceeds the 2 GiB output limit");
     }
-    let output_probe = probe_media(&options.ffprobe, &output_temp)?;
-    let output_frame_count = count_video_frames(&options.ffprobe, &output_temp, timeout)?;
-    verify_output(&validated, &output_probe, output_frame_count)?;
+    let output_probe =
+        probe_media_cancellable(&options.ffprobe, &output_temp, cancellation.as_deref())?;
+    let output_frame_count = count_video_frames(
+        &options.ffprobe,
+        &output_temp,
+        timeout,
+        cancellation.as_deref(),
+    )?;
+    ensure_not_cancelled(cancellation.as_deref())?;
+    verify_output(&validated, &output_probe, output_frame_count, preset)?;
     let output_hash = hash_file(&output_temp)?;
     let font_hash = font.as_ref().map(|font| font.sha256.as_str());
     let provenance = build_provenance(
@@ -151,7 +235,9 @@ pub fn render_timeline(options: RenderOptions) -> Result<RenderResult> {
         &ffmpeg,
         &ffprobe,
         &output_hash,
+        preset,
     );
+    ensure_not_cancelled(cancellation.as_deref())?;
 
     let serialized = serde_json::to_vec_pretty(&provenance)?;
     let mut provenance_file = OpenOptions::new()
@@ -167,6 +253,7 @@ pub fn render_timeline(options: RenderOptions) -> Result<RenderResult> {
         .context("could not flush provenance sidecar")?;
 
     // Both files are staged beside their destinations so publication stays on one volume.
+    ensure_not_cancelled(cancellation.as_deref())?;
     ensure_output_absent(&output_path, &provenance_path)?;
     fs::rename(&output_temp, &output_path)
         .with_context(|| format!("could not publish output to {}", output_path.display()))?;
@@ -254,8 +341,9 @@ struct AudioRenderNode {
     gain: f64,
 }
 
-fn build_render_plan(validated: &ValidatedTimeline) -> Result<RenderPlan> {
+fn build_render_plan(validated: &ValidatedTimeline, preset: RenderPreset) -> Result<RenderPlan> {
     let timeline = &validated.timeline;
+    let (width, height) = preset.output_dimensions(timeline.canvas.width, timeline.canvas.height);
     let video_track = &timeline.tracks[validated.video_track_index];
     let mut video_clips: Vec<&VideoClip> = video_track
         .clips
@@ -290,10 +378,16 @@ fn build_render_plan(validated: &ValidatedTimeline) -> Result<RenderPlan> {
             start_frame: text.start_frame,
             end_frame: text.start_frame + text.duration_frames,
             text: text.text.clone(),
-            font_size: text.font_size,
+            font_size: scale_text_font_size(
+                text.font_size,
+                timeline.canvas.width,
+                timeline.canvas.height,
+                width,
+                height,
+            ),
             color: text.color.clone(),
-            x: text.x,
-            y: text.y,
+            x: scale_coordinate(text.x, timeline.canvas.width, width),
+            y: scale_coordinate(text.y, timeline.canvas.height, height),
         });
     }
 
@@ -326,8 +420,8 @@ fn build_render_plan(validated: &ValidatedTimeline) -> Result<RenderPlan> {
     }
 
     Ok(RenderPlan {
-        width: timeline.canvas.width,
-        height: timeline.canvas.height,
+        width,
+        height,
         fps: timeline.canvas.fps,
         background: timeline.canvas.background.clone(),
         audio_sample_rate: timeline.settings.audio_sample_rate,
@@ -342,6 +436,24 @@ fn build_render_plan(validated: &ValidatedTimeline) -> Result<RenderPlan> {
         text_clips: text_nodes,
         audio_clips: audio_nodes,
     })
+}
+
+fn scale_coordinate(value: u32, source_extent: u32, output_extent: u32) -> u32 {
+    let scaled = u64::from(value) * u64::from(output_extent);
+    u32::try_from((scaled + u64::from(source_extent) / 2) / u64::from(source_extent))
+        .unwrap_or(u32::MAX)
+}
+
+fn scale_text_font_size(
+    font_size: u32,
+    source_width: u32,
+    source_height: u32,
+    output_width: u32,
+    output_height: u32,
+) -> u32 {
+    scale_coordinate(font_size, source_width, output_width)
+        .min(scale_coordinate(font_size, source_height, output_height))
+        .max(1)
 }
 
 fn compile_filter_graph(
@@ -438,11 +550,14 @@ struct FfmpegInvocation<'a> {
     output: &'a Path,
     frames: u64,
     has_audio: bool,
+    preset: RenderPreset,
     timeout: Duration,
+    cancellation: Option<&'a AtomicBool>,
 }
 
 fn run_ffmpeg(invocation: FfmpegInvocation<'_>) -> Result<()> {
     let mut command = Command::new(invocation.executable);
+    let (encoder_preset, crf) = invocation.preset.encoder_settings();
     command
         .current_dir(invocation.work_dir)
         .arg("-hide_banner")
@@ -477,9 +592,9 @@ fn run_ffmpeg(invocation: FfmpegInvocation<'_>) -> Result<()> {
         .arg("-c:v")
         .arg("libx264")
         .arg("-preset")
-        .arg("medium")
+        .arg(encoder_preset)
         .arg("-crf")
-        .arg("20")
+        .arg(crf)
         .arg("-pix_fmt")
         .arg("yuv420p")
         .arg("-threads")
@@ -499,7 +614,19 @@ fn run_ffmpeg(invocation: FfmpegInvocation<'_>) -> Result<()> {
         .arg("-fs")
         .arg(MAX_OUTPUT_BYTES.to_string())
         .arg(invocation.output);
-    run_checked(&mut command, invocation.timeout, "FFmpeg render")?;
+    run_checked_cancellable(
+        &mut command,
+        invocation.timeout,
+        "FFmpeg render",
+        invocation.cancellation,
+    )?;
+    Ok(())
+}
+
+fn ensure_not_cancelled(cancellation: Option<&AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|token| token.load(Ordering::Acquire)) {
+        bail!("render was cancelled");
+    }
     Ok(())
 }
 
@@ -507,14 +634,19 @@ fn verify_output(
     validated: &ValidatedTimeline,
     probe: &MediaProbe,
     actual_frame_count: u64,
+    preset: RenderPreset,
 ) -> Result<()> {
+    let (expected_width, expected_height) = preset.output_dimensions(
+        validated.timeline.canvas.width,
+        validated.timeline.canvas.height,
+    );
     let video = probe
         .video
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("rendered output has no video stream"))?;
     if video.codec != "h264"
-        || video.width != Some(validated.timeline.canvas.width)
-        || video.height != Some(validated.timeline.canvas.height)
+        || video.width != Some(expected_width)
+        || video.height != Some(expected_height)
     {
         bail!("rendered output does not match requested H.264 dimensions");
     }
@@ -581,8 +713,13 @@ struct FrameCountStream {
     nb_read_frames: Option<String>,
 }
 
-fn count_video_frames(ffprobe: &Path, file: &Path, timeout: Duration) -> Result<u64> {
-    let output = run_checked(
+fn count_video_frames(
+    ffprobe: &Path,
+    file: &Path,
+    timeout: Duration,
+    cancellation: Option<&AtomicBool>,
+) -> Result<u64> {
+    let output = run_checked_cancellable(
         Command::new(ffprobe)
             .arg("-v")
             .arg("error")
@@ -598,6 +735,7 @@ fn count_video_frames(ffprobe: &Path, file: &Path, timeout: Duration) -> Result<
             .arg(file),
         timeout,
         "ffprobe frame count",
+        cancellation,
     )?;
     let parsed: FrameCountOutput = serde_json::from_slice(&output.stdout)
         .context("ffprobe returned malformed frame-count metadata")?;
@@ -624,6 +762,7 @@ fn build_provenance<'a>(
     ffmpeg: &'a ToolIdentity,
     ffprobe: &'a ToolIdentity,
     output_hash: &'a str,
+    preset: RenderPreset,
 ) -> Provenance<'a> {
     let assets = validated
         .assets
@@ -645,11 +784,24 @@ fn build_provenance<'a>(
         ffmpeg_fingerprint: &ffmpeg.fingerprint,
         ffprobe_version: &ffprobe.version,
         ffprobe_fingerprint: &ffprobe.fingerprint,
-        width: validated.timeline.canvas.width,
-        height: validated.timeline.canvas.height,
+        width: preset
+            .output_dimensions(
+                validated.timeline.canvas.width,
+                validated.timeline.canvas.height,
+            )
+            .0,
+        height: preset
+            .output_dimensions(
+                validated.timeline.canvas.width,
+                validated.timeline.canvas.height,
+            )
+            .1,
         fps: fps_string(validated.timeline.canvas.fps),
         frame_count: validated.total_frames,
-        video_encoder: "libx264, preset=medium, crf=20, pix_fmt=yuv420p",
+        video_encoder: match preset {
+            RenderPreset::Export => "libx264, preset=medium, crf=20, pix_fmt=yuv420p",
+            RenderPreset::Preview => "libx264, preset=veryfast, crf=28, pix_fmt=yuv420p",
+        },
         audio_encoder: if validated.audio_clips.is_empty() {
             None
         } else {
@@ -662,6 +814,7 @@ fn build_provenance<'a>(
             .export_preset
             .as_deref()
             .unwrap_or("custom"),
+        render_preset: preset.id(),
     }
 }
 
@@ -787,11 +940,16 @@ struct ToolIdentity {
     fingerprint: String,
 }
 
-fn tool_identity(path: &Path, timeout: Duration) -> Result<ToolIdentity> {
-    let output = run_checked(
+fn tool_identity(
+    path: &Path,
+    timeout: Duration,
+    cancellation: Option<&AtomicBool>,
+) -> Result<ToolIdentity> {
+    let output = run_checked_cancellable(
         Command::new(path).arg("-version"),
         timeout.min(Duration::from_secs(10)),
         &format!("{} version check", path.display()),
+        cancellation,
     )?;
     let version = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -856,5 +1014,44 @@ mod tests {
         assert_eq!(parse_frame_rate("30000/1001"), Some((30_000, 1_001)));
         assert_eq!(parse_frame_rate("0/0"), None);
         assert_eq!(parse_frame_rate("24"), None);
+    }
+
+    #[test]
+    fn preview_dimensions_scale_landscape_and_portrait_without_upscaling() {
+        assert_eq!(
+            RenderPreset::Preview.output_dimensions(1920, 1080),
+            (640, 360)
+        );
+        assert_eq!(
+            RenderPreset::Preview.output_dimensions(1080, 1920),
+            (360, 640)
+        );
+        assert_eq!(
+            RenderPreset::Preview.output_dimensions(1280, 720),
+            (640, 360)
+        );
+        assert_eq!(
+            RenderPreset::Preview.output_dimensions(320, 240),
+            (320, 240)
+        );
+        assert_eq!(
+            RenderPreset::Preview.output_dimensions(640, 640),
+            (640, 640)
+        );
+        assert_eq!(
+            RenderPreset::Export.output_dimensions(1920, 1080),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn preview_rounding_keeps_small_and_odd_aspect_dimensions_valid() {
+        let (width, height) = RenderPreset::Preview.output_dimensions(1920, 2);
+        assert_eq!(width, 640);
+        assert_eq!(height, 2);
+        assert_eq!(height % 2, 0);
+        assert_eq!(scale_coordinate(24, 1920, 640), 8);
+        assert_eq!(scale_text_font_size(48, 1920, 1080, 640, 360), 16);
+        assert_eq!(scale_text_font_size(1, 1920, 1080, 640, 360), 1);
     }
 }

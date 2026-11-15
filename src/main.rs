@@ -115,6 +115,15 @@ enum ApiCommand {
         workspace: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
+        #[arg(long, default_value = "ffmpeg")]
+        ffmpeg: PathBuf,
+        #[arg(long, default_value = "ffprobe")]
+        ffprobe: PathBuf,
+        /// Required when stored timelines contain text clips.
+        #[arg(long)]
+        font: Option<PathBuf>,
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
     },
 }
 
@@ -214,6 +223,10 @@ async fn main() -> Result<()> {
                     database,
                     workspace,
                     bind,
+                    ffmpeg,
+                    ffprobe,
+                    font,
+                    timeout_seconds,
                 },
         } => {
             let bearer_token = std::env::var("STUDIO_API_TOKEN")
@@ -223,6 +236,10 @@ async fn main() -> Result<()> {
                 workspace,
                 bind,
                 bearer_token,
+                ffmpeg,
+                ffprobe,
+                font,
+                timeout_seconds,
             })
             .await?;
         }

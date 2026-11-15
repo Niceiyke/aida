@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 
@@ -12,7 +13,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    process::run_checked,
+    process::run_checked_cancellable,
     workspace::{AssetManifest, SOURCE_FILENAME, Workspace},
 };
 
@@ -156,7 +157,15 @@ pub fn import_asset(options: ImportOptions) -> Result<ImportedAsset> {
 }
 
 pub fn probe_media(ffprobe: &Path, file: &Path) -> Result<MediaProbe> {
-    let output = run_checked(
+    probe_media_cancellable(ffprobe, file, None)
+}
+
+pub(crate) fn probe_media_cancellable(
+    ffprobe: &Path,
+    file: &Path,
+    cancellation: Option<&AtomicBool>,
+) -> Result<MediaProbe> {
+    let output = run_checked_cancellable(
         Command::new(ffprobe)
             .arg("-v")
             .arg("error")
@@ -169,6 +178,7 @@ pub fn probe_media(ffprobe: &Path, file: &Path) -> Result<MediaProbe> {
             .arg(file),
         PROBE_TIMEOUT,
         "ffprobe",
+        cancellation,
     )?;
     let parsed: ProbeOutput =
         serde_json::from_slice(&output.stdout).context("ffprobe returned malformed metadata")?;

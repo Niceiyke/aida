@@ -71,14 +71,21 @@ Milestones are evidence-driven rather than week-based. Phases 4 and 5 can overla
 - [x] Add `studio project create`, `studio edit` and `studio render-revision`; implement `text.update` and `audio.gain.set` with full-timeline validation, stale-revision conflicts and idempotent replay.
 - [x] Exercise invalid-batch rollback, conflicting retries, stale revisions, a concurrent same-revision race, persistence after reopening the database, and rendering a stored revision.
 
-This remains a partial Release A. It uses bundled SQLite through `rusqlite`; the database is single-user, jobs/MCP are absent, and the HTTP layer is limited to authenticated loopback project/timeline/operation routes.
+This remains a partial Release A. It uses bundled SQLite through `rusqlite`; the database is single-user and the HTTP layer is authenticated and loopback-only.
 
 ### Tasks
 - [x] Add authenticated loopback REST routes for project creation/metadata, current or pinned timeline retrieval, and atomic operations.
 - [ ] Publish OpenAPI contract and generated client.
-- [ ] Extend persistence with API operation/audit records, revision restore and concurrent-writer load tests; keep CLI and API mutations on the same application service.
-- [ ] Add remaining asset and render endpoints, plus project revision history.
-- [ ] Add SQLite-backed in-process jobs, bounded retries, lease recovery, cancellation and status polling; rendered preview files use a preview preset and are retrievable through the asset endpoint.
+- [ ] Extend persistence with API operation/audit records and concurrent-writer load tests; keep CLI and API mutations on the same application service.
+- [x] Add project revision history and idempotent restore as a new immutable revision.
+- [ ] Add remaining source-asset endpoints.
+- [x] Add SQLite-backed in-process export jobs with revision pinning, idempotent enqueue, one worker, cancellation, lease recovery after restart, atomic output publication, and status polling.
+- [x] Add output asset IDs and authenticated streaming retrieval for successful exports.
+- [x] Add idempotent explicit retries for the latest failed job, bounded to two retries.
+- [x] Add a downscaled preview render preset to the existing persistent job pipeline.
+- [x] Expose imported source asset metadata and content through authenticated API routes.
+- [x] Verify asset size and SHA-256 on an opened file handle before streaming downloads.
+- [ ] Add source-media upload endpoints.
 - [ ] Implement MCP tools: create_project, import_media, get_timeline, edit_timeline, render, get_job, inspect_output.
 - [ ] Add token scopes, audit trail, structured error mapping and usage limits.
 - [ ] Build scripted agent test with revision conflict recovery.

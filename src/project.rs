@@ -2,7 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    RenderOptions, RenderResult, render_timeline,
+    RenderOptions, RenderResult,
+    render::RenderPreset,
     timeline::{
         Clip, TextClip, Timeline, TrackKind, ValidatedTimeline, load_and_validate, validate,
         validate_json_document,
@@ -21,11 +22,13 @@ use crate::{
     workspace::Workspace,
 };
 
-const DATABASE_VERSION: i32 = 1;
+const DATABASE_VERSION: i32 = 3;
 const MAX_EDIT_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_BATCH_OPERATIONS: usize = 100;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RENDER_JOB_ATTEMPTS: i64 = 3;
+const MAX_EXPLICIT_RENDER_RETRIES: i64 = 2;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -75,10 +78,116 @@ pub struct ProjectSummary {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProjectRevisionEntry {
+    pub revision: u64,
+    pub created_at: String,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRevisionHistory {
+    pub project_id: String,
+    pub current_revision: u64,
+    pub revisions: Vec<ProjectRevisionEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EditResult {
     pub project_id: String,
     pub revision: u64,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRestoreResult {
+    pub project_id: String,
+    pub revision: u64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderJobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl RenderJobStatus {
+    fn from_database_value(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => bail!("database contains an invalid render job status"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderJob {
+    pub job_id: String,
+    pub project_id: String,
+    pub revision: u64,
+    pub preset_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_of_job_id: Option<String>,
+    pub retry_number: u32,
+    pub status: RenderJobStatus,
+    pub attempt: u32,
+    pub cancel_requested: bool,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_asset_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<RenderJobResult>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderJobResult {
+    pub timeline_sha256: String,
+    pub output_sha256: String,
+    pub output_duration_seconds: f64,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub output_frame_count: u64,
+    pub output_frame_rate: String,
+    pub video_codec: String,
+    pub audio_codec: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RenderAssetLocation {
+    pub asset_id: String,
+    pub job_id: String,
+    pub attempt: u32,
+    pub output_sha256: String,
+    pub preset_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderJobSubmission {
+    pub job: RenderJob,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExpiredRenderAttempt {
+    pub job_id: String,
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +203,10 @@ impl ProjectStore {
         let mut connection = store.connect()?;
         store.ensure_schema(&mut connection)?;
         Ok(store)
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.database
     }
 
     pub fn create_from_timeline(
@@ -273,6 +386,145 @@ impl ProjectStore {
             })
     }
 
+    pub fn get_project_revision_history(&self, project_id: &str) -> Result<ProjectRevisionHistory> {
+        validate_project_id(project_id)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let current_sql = transaction
+            .query_row(
+                "SELECT current_revision FROM projects WHERE project_id = ?1",
+                [project_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("PROJECT_NOT_FOUND: project {project_id} does not exist"))?;
+        let current_revision = from_sql_revision(current_sql)?;
+        let mut revisions = Vec::new();
+        {
+            let mut statement = transaction.prepare(
+                "SELECT revision, created_at FROM revisions WHERE project_id = ?1 ORDER BY revision DESC",
+            )?;
+            let rows = statement.query_map([project_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (revision, created_at) = row?;
+                let revision = from_sql_revision(revision)?;
+                revisions.push(ProjectRevisionEntry {
+                    revision,
+                    created_at,
+                    is_current: revision == current_revision,
+                });
+            }
+        }
+        transaction.commit()?;
+        Ok(ProjectRevisionHistory {
+            project_id: project_id.to_owned(),
+            current_revision,
+            revisions,
+        })
+    }
+
+    pub fn restore_revision(
+        &self,
+        workspace_path: &Path,
+        project_id: &str,
+        target_revision: u64,
+        expected_revision: u64,
+        idempotency_key: &str,
+    ) -> Result<ProjectRestoreResult> {
+        validate_project_id(project_id)?;
+        validate_idempotency_key(idempotency_key)?;
+        let target_sql = to_sql_revision(target_revision)?;
+        to_sql_revision(expected_revision)?;
+        let request_sha256 = restore_request_digest(target_revision, expected_revision)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some((stored_digest, result_revision)) = transaction
+            .query_row(
+                "SELECT request_sha256, result_revision FROM idempotency_records \
+                 WHERE project_id = ?1 AND idempotency_key = ?2",
+                rusqlite::params![project_id, idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_digest != request_sha256 {
+                bail!(
+                    "IDEMPOTENCY_CONFLICT: key was already used for a different project mutation"
+                );
+            }
+            let revision = from_sql_revision(result_revision)?;
+            transaction.commit()?;
+            return Ok(ProjectRestoreResult {
+                project_id: project_id.to_owned(),
+                revision,
+                replayed: true,
+            });
+        }
+
+        let current_sql = transaction
+            .query_row(
+                "SELECT current_revision FROM projects WHERE project_id = ?1",
+                [project_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("PROJECT_NOT_FOUND: project {project_id} does not exist"))?;
+        let current_revision = from_sql_revision(current_sql)?;
+        if current_revision != expected_revision {
+            bail!(
+                "REVISION_CONFLICT: expected revision {expected_revision}; current revision is {current_revision}"
+            );
+        }
+
+        let target_json = transaction
+            .query_row(
+                "SELECT timeline_json FROM revisions WHERE project_id = ?1 AND revision = ?2",
+                rusqlite::params![project_id, target_sql],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                anyhow!("REVISION_NOT_FOUND: revision {target_revision} does not exist for project {project_id}")
+            })?;
+        let next_revision = current_revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("project revision overflow"))?;
+        let mut timeline: Timeline =
+            serde_json::from_str(&target_json).context("stored project timeline is invalid")?;
+        timeline.revision = next_revision;
+        let workspace = Workspace::open(workspace_path)?;
+        let validated = validate(timeline, &workspace)?;
+        let timeline_json = serde_json::to_string(&validated.timeline)?;
+        let next_sql = to_sql_revision(next_revision)?;
+
+        transaction.execute(
+            "INSERT INTO revisions (project_id, revision, timeline_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![project_id, next_sql, timeline_json],
+        )?;
+        let updated = transaction.execute(
+            "UPDATE projects SET current_revision = ?1 WHERE project_id = ?2 AND current_revision = ?3",
+            rusqlite::params![next_sql, project_id, current_sql],
+        )?;
+        if updated != 1 {
+            bail!("REVISION_CONFLICT: project changed while restoring the revision");
+        }
+        transaction.execute(
+            "INSERT INTO idempotency_records \
+             (project_id, idempotency_key, request_sha256, result_revision) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![project_id, idempotency_key, request_sha256, next_sql],
+        )?;
+        transaction.commit()?;
+        Ok(ProjectRestoreResult {
+            project_id: project_id.to_owned(),
+            revision: next_revision,
+            replayed: false,
+        })
+    }
+
     pub fn get_project_summary(&self, project_id: &str) -> Result<ProjectSummary> {
         validate_project_id(project_id)?;
         let current_revision = self
@@ -308,6 +560,410 @@ impl ProjectStore {
         Ok((from_sql_revision(row.0)?, row.1))
     }
 
+    pub fn enqueue_render_job(
+        &self,
+        project_id: &str,
+        revision: u64,
+        preset_id: &str,
+        idempotency_key: &str,
+    ) -> Result<RenderJobSubmission> {
+        validate_project_id(project_id)?;
+        RenderPreset::parse(preset_id)?;
+        validate_idempotency_key(idempotency_key)?;
+        let revision_sql = to_sql_revision(revision)?;
+        let request_sha256 = render_request_digest(project_id, revision, preset_id)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some((job_id, stored_digest)) = transaction
+            .query_row(
+                "SELECT job_id, request_sha256 FROM render_jobs \
+                 WHERE project_id = ?1 AND idempotency_key = ?2",
+                rusqlite::params![project_id, idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_digest != request_sha256 {
+                bail!("IDEMPOTENCY_CONFLICT: key was already used for a different render request");
+            }
+            let job = load_render_job(&transaction, &job_id)?;
+            transaction.commit()?;
+            return Ok(RenderJobSubmission {
+                job,
+                replayed: true,
+            });
+        }
+
+        let project_exists = transaction
+            .query_row(
+                "SELECT 1 FROM projects WHERE project_id = ?1",
+                [project_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !project_exists {
+            bail!("PROJECT_NOT_FOUND: project {project_id} does not exist");
+        }
+        let revision_exists = transaction
+            .query_row(
+                "SELECT 1 FROM revisions WHERE project_id = ?1 AND revision = ?2",
+                rusqlite::params![project_id, revision_sql],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !revision_exists {
+            bail!(
+                "REVISION_NOT_FOUND: revision {revision} does not exist for project {project_id}"
+            );
+        }
+
+        let job_id = Uuid::new_v4().to_string();
+        transaction.execute(
+            "INSERT INTO render_jobs (job_id, project_id, revision, preset_id, idempotency_key, request_sha256, status, retry_root_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?1)",
+            rusqlite::params![job_id, project_id, revision_sql, preset_id, idempotency_key, request_sha256],
+        )?;
+        let job = load_render_job(&transaction, &job_id)?;
+        transaction.commit()?;
+        Ok(RenderJobSubmission {
+            job,
+            replayed: false,
+        })
+    }
+
+    pub fn retry_render_job(
+        &self,
+        job_id: &str,
+        idempotency_key: &str,
+    ) -> Result<RenderJobSubmission> {
+        validate_project_id(job_id).context("jobId must be a UUID")?;
+        validate_idempotency_key(idempotency_key)?;
+        let request_sha256 = retry_request_digest(job_id)?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some((result_job_id, stored_digest)) = transaction
+            .query_row(
+                "SELECT result_job_id, request_sha256 FROM render_job_retries \
+                 WHERE source_job_id = ?1 AND idempotency_key = ?2",
+                rusqlite::params![job_id, idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if stored_digest != request_sha256 {
+                bail!("IDEMPOTENCY_CONFLICT: retry key was used for a different request");
+            }
+            let job = load_render_job(&transaction, &result_job_id)?;
+            transaction.commit()?;
+            return Ok(RenderJobSubmission {
+                job,
+                replayed: true,
+            });
+        }
+
+        let source = transaction
+            .query_row(
+                "SELECT project_id, revision, preset_id, status, retry_root_id, retry_number \
+                 FROM render_jobs WHERE job_id = ?1",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("JOB_NOT_FOUND: render job {job_id} does not exist"))?;
+        if source.3 != "failed" {
+            bail!("JOB_NOT_RETRYABLE: only failed render jobs may be retried");
+        }
+        let latest = transaction.query_row(
+            "SELECT job_id, retry_number FROM render_jobs \
+             WHERE retry_root_id = ?1 ORDER BY retry_number DESC LIMIT 1",
+            [&source.4],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        if latest.0 != job_id || latest.1 != source.5 {
+            bail!("JOB_NOT_RETRYABLE: a newer retry already exists for this render");
+        }
+        let retry_number = source
+            .5
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("render retry count overflow"))?;
+        if retry_number > MAX_EXPLICIT_RENDER_RETRIES {
+            bail!("JOB_RETRY_LIMIT: render job reached its explicit retry limit");
+        }
+
+        let revision = from_sql_revision(source.1)?;
+        let job_id_new = Uuid::new_v4().to_string();
+        let internal_key = format!("retry-{job_id_new}");
+        let render_digest = render_request_digest(&source.0, revision, &source.2)?;
+        transaction.execute(
+            "INSERT INTO render_jobs (job_id, project_id, revision, preset_id, idempotency_key, request_sha256, status, retry_of_job_id, retry_root_id, retry_number) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9)",
+            rusqlite::params![
+                job_id_new,
+                source.0,
+                source.1,
+                source.2,
+                internal_key,
+                render_digest,
+                job_id,
+                source.4,
+                retry_number,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO render_job_retries (source_job_id, idempotency_key, request_sha256, result_job_id) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![job_id, idempotency_key, request_sha256, job_id_new],
+        )?;
+        let job = load_render_job(&transaction, &job_id_new)?;
+        transaction.commit()?;
+        Ok(RenderJobSubmission {
+            job,
+            replayed: false,
+        })
+    }
+
+    pub fn get_render_job(&self, job_id: &str) -> Result<RenderJob> {
+        validate_project_id(job_id).context("jobId must be a UUID")?;
+        load_render_job(&self.connect()?, job_id)
+    }
+
+    pub(crate) fn get_render_asset(&self, asset_id: &str) -> Result<RenderAssetLocation> {
+        validate_project_id(asset_id).context("assetId must be a UUID")?;
+        let row = self
+            .connect()?
+            .query_row(
+                "SELECT job_id, attempt, preset_id, result_json FROM render_jobs \
+                 WHERE output_asset_id = ?1 AND status = 'succeeded'",
+                [asset_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("ASSET_NOT_FOUND: render output {asset_id} does not exist"))?;
+        let result: RenderResult =
+            serde_json::from_str(&row.3).context("stored render job result is invalid")?;
+        Ok(RenderAssetLocation {
+            asset_id: asset_id.to_owned(),
+            job_id: row.0,
+            attempt: u32::try_from(row.1).context("database contains an invalid job attempt")?,
+            output_sha256: result.output_sha256,
+            preset_id: row.2,
+        })
+    }
+
+    pub fn cancel_render_job(&self, job_id: &str) -> Result<RenderJob> {
+        validate_project_id(job_id).context("jobId must be a UUID")?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE render_jobs SET \
+                status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END, \
+                cancel_requested = CASE WHEN status IN ('queued', 'running') THEN 1 ELSE cancel_requested END, \
+                worker_id = CASE WHEN status = 'queued' THEN NULL ELSE worker_id END, \
+                lease_expires_at = CASE WHEN status = 'queued' THEN NULL ELSE lease_expires_at END, \
+                finished_at = CASE WHEN status = 'queued' THEN CURRENT_TIMESTAMP ELSE finished_at END, \
+                updated_at = CURRENT_TIMESTAMP \
+             WHERE job_id = ?1 AND status IN ('queued', 'running')",
+            [job_id],
+        )?;
+        let job = load_render_job(&transaction, job_id)?;
+        transaction.commit()?;
+        Ok(job)
+    }
+
+    pub(crate) fn claim_next_render_job(
+        &self,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<Option<RenderJob>> {
+        let now = unix_time_seconds()?;
+        let lease_seconds = i64::try_from(lease_seconds).context("render job lease is too long")?;
+        let lease_expires_at = now
+            .checked_add(lease_seconds)
+            .ok_or_else(|| anyhow!("render job lease timestamp overflow"))?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let job_id = transaction
+            .query_row(
+                "SELECT job_id FROM render_jobs WHERE status = 'queued' \
+                 ORDER BY created_at, job_id LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(job_id) = job_id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let updated = transaction.execute(
+            "UPDATE render_jobs SET status = 'running', attempt = attempt + 1, \
+                worker_id = ?1, lease_expires_at = ?2, cancel_requested = 0, \
+                started_at = COALESCE(started_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP \
+             WHERE job_id = ?3 AND status = 'queued'",
+            rusqlite::params![worker_id, lease_expires_at, job_id],
+        )?;
+        if updated != 1 {
+            bail!("render job queue changed while claiming work");
+        }
+        let job = load_render_job(&transaction, &job_id)?;
+        transaction.commit()?;
+        Ok(Some(job))
+    }
+
+    pub(crate) fn heartbeat_render_job(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<Option<bool>> {
+        let now = unix_time_seconds()?;
+        let lease_seconds = i64::try_from(lease_seconds).context("render job lease is too long")?;
+        let lease_expires_at = now
+            .checked_add(lease_seconds)
+            .ok_or_else(|| anyhow!("render job lease timestamp overflow"))?;
+        let connection = self.connect()?;
+        let updated = connection.execute(
+            "UPDATE render_jobs SET lease_expires_at = ?1, updated_at = CURRENT_TIMESTAMP \
+             WHERE job_id = ?2 AND worker_id = ?3 AND status = 'running'",
+            rusqlite::params![lease_expires_at, job_id, worker_id],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        let cancel_requested = connection.query_row(
+            "SELECT cancel_requested FROM render_jobs WHERE job_id = ?1",
+            [job_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(Some(cancel_requested))
+    }
+
+    pub(crate) fn recover_expired_render_jobs(&self) -> Result<Vec<ExpiredRenderAttempt>> {
+        let now = unix_time_seconds()?;
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expired = {
+            let mut statement = transaction.prepare(
+                "SELECT job_id, attempt, cancel_requested FROM render_jobs \
+                 WHERE status = 'running' AND lease_expires_at <= ?1",
+            )?;
+            statement
+                .query_map([now], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut attempts = Vec::with_capacity(expired.len());
+        for (job_id, attempt, cancel_requested) in expired {
+            let status = if cancel_requested {
+                "cancelled"
+            } else if attempt >= MAX_RENDER_JOB_ATTEMPTS {
+                "failed"
+            } else {
+                "queued"
+            };
+            transaction.execute(
+                "UPDATE render_jobs SET status = ?1, worker_id = NULL, lease_expires_at = NULL, \
+                    cancel_requested = CASE WHEN ?1 = 'cancelled' THEN 1 ELSE 0 END, \
+                    error = CASE WHEN ?1 = 'queued' THEN 'worker lease expired; job requeued' \
+                                 WHEN ?1 = 'failed' THEN 'worker lease expired after the maximum attempts' \
+                                 ELSE 'render cancelled' END, \
+                    finished_at = CASE WHEN ?1 IN ('cancelled', 'failed') THEN CURRENT_TIMESTAMP ELSE NULL END, \
+                    updated_at = CURRENT_TIMESTAMP \
+                 WHERE job_id = ?2 AND status = 'running' AND lease_expires_at <= ?3",
+                rusqlite::params![status, job_id, now],
+            )?;
+            attempts.push(ExpiredRenderAttempt {
+                job_id,
+                attempt: u32::try_from(attempt)
+                    .context("database contains an invalid job attempt")?,
+            });
+        }
+        transaction.commit()?;
+        Ok(attempts)
+    }
+
+    pub(crate) fn complete_render_job(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        output_asset_id: &str,
+        result: &RenderResult,
+    ) -> Result<bool> {
+        validate_project_id(output_asset_id).context("outputAssetId must be a UUID")?;
+        let result_json = serde_json::to_string(result)?;
+        let updated = self.connect()?.execute(
+            "UPDATE render_jobs SET status = 'succeeded', result_json = ?1, output_asset_id = ?2, error = NULL, \
+                worker_id = NULL, lease_expires_at = NULL, finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE job_id = ?3 AND worker_id = ?4 AND status = 'running' AND cancel_requested = 0",
+            rusqlite::params![result_json, output_asset_id, job_id, worker_id],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub(crate) fn fail_render_job(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let error = truncate_error(error, 16 * 1024);
+        let updated = self.connect()?.execute(
+            "UPDATE render_jobs SET status = 'failed', error = ?1, worker_id = NULL, \
+                lease_expires_at = NULL, finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE job_id = ?2 AND worker_id = ?3 AND status = 'running' AND cancel_requested = 0",
+            rusqlite::params![error, job_id, worker_id],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub(crate) fn finish_cancelled_render_job(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let updated = self.connect()?.execute(
+            "UPDATE render_jobs SET status = 'cancelled', error = 'render cancelled', worker_id = NULL, \
+                lease_expires_at = NULL, cancel_requested = 1, finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE job_id = ?1 AND worker_id = ?2 AND status = 'running'",
+            rusqlite::params![job_id, worker_id],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub(crate) fn requeue_render_job(&self, job_id: &str, worker_id: &str) -> Result<bool> {
+        let updated = self.connect()?.execute(
+            "UPDATE render_jobs SET status = 'queued', error = 'worker shutting down; job retained', \
+                worker_id = NULL, lease_expires_at = NULL, cancel_requested = 0, updated_at = CURRENT_TIMESTAMP \
+             WHERE job_id = ?1 AND worker_id = ?2 AND status = 'running' AND cancel_requested = 0",
+            rusqlite::params![job_id, worker_id],
+        )?;
+        Ok(updated == 1)
+    }
+
     fn connect(&self) -> Result<Connection> {
         let connection = Connection::open(&self.database).with_context(|| {
             format!(
@@ -321,20 +977,166 @@ impl ProjectStore {
     }
 
     fn ensure_schema(&self, connection: &mut Connection) -> Result<()> {
-        let version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match version {
-            DATABASE_VERSION => Ok(()),
-            0 => {
-                let transaction =
-                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                transaction.execute_batch(include_str!("../migrations/0001_initial.sql"))?;
-                transaction.pragma_update(None, "user_version", DATABASE_VERSION)?;
-                transaction.commit()?;
-                Ok(())
-            }
-            other => bail!("unsupported project database version {other}"),
+        let mut version: i32 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if !(0..=DATABASE_VERSION).contains(&version) {
+            bail!("unsupported project database version {version}");
         }
+        while version < DATABASE_VERSION {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let next_version = match version {
+                0 => {
+                    transaction.execute_batch(include_str!("../migrations/0001_initial.sql"))?;
+                    1
+                }
+                1 => {
+                    transaction
+                        .execute_batch(include_str!("../migrations/0002_render_jobs.sql"))?;
+                    2
+                }
+                2 => {
+                    transaction.execute_batch(include_str!(
+                        "../migrations/0003_render_assets_and_retries.sql"
+                    ))?;
+                    3
+                }
+                _ => bail!("no migration available from project database version {version}"),
+            };
+            transaction.pragma_update(None, "user_version", next_version)?;
+            transaction.commit()?;
+            version = next_version;
+        }
+        Ok(())
     }
+}
+
+struct StoredRenderJob {
+    job_id: String,
+    project_id: String,
+    revision: i64,
+    preset_id: String,
+    retry_of_job_id: Option<String>,
+    retry_number: i64,
+    status: String,
+    attempt: i64,
+    cancel_requested: bool,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    output_asset_id: Option<String>,
+    result_json: Option<String>,
+    error: Option<String>,
+}
+
+fn load_render_job(connection: &Connection, job_id: &str) -> Result<RenderJob> {
+    let stored = connection
+        .query_row(
+            "SELECT job_id, project_id, revision, preset_id, retry_of_job_id, retry_number, status, attempt, cancel_requested, \
+                created_at, started_at, finished_at, output_asset_id, result_json, error \
+             FROM render_jobs WHERE job_id = ?1",
+            [job_id],
+            |row| {
+                Ok(StoredRenderJob {
+                    job_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    revision: row.get(2)?,
+                    preset_id: row.get(3)?,
+                    retry_of_job_id: row.get(4)?,
+                    retry_number: row.get(5)?,
+                    status: row.get(6)?,
+                    attempt: row.get(7)?,
+                    cancel_requested: row.get(8)?,
+                    created_at: row.get(9)?,
+                    started_at: row.get(10)?,
+                    finished_at: row.get(11)?,
+                    output_asset_id: row.get(12)?,
+                    result_json: row.get(13)?,
+                    error: row.get(14)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("JOB_NOT_FOUND: render job {job_id} does not exist"))?;
+    let stored_result: Option<RenderResult> = stored
+        .result_json
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .context("stored render job result is invalid")?;
+    let result = stored_result.map(|result| RenderJobResult {
+        timeline_sha256: result.timeline_sha256,
+        output_sha256: result.output_sha256,
+        output_duration_seconds: result.output_duration_seconds,
+        output_width: result.output_width,
+        output_height: result.output_height,
+        output_frame_count: result.output_frame_count,
+        output_frame_rate: result.output_frame_rate,
+        video_codec: result.video_codec,
+        audio_codec: result.audio_codec,
+    });
+    Ok(RenderJob {
+        job_id: stored.job_id,
+        project_id: stored.project_id,
+        revision: from_sql_revision(stored.revision)?,
+        preset_id: stored.preset_id,
+        retry_of_job_id: stored.retry_of_job_id,
+        retry_number: u32::try_from(stored.retry_number)
+            .context("database contains an invalid retry number")?,
+        status: RenderJobStatus::from_database_value(&stored.status)?,
+        attempt: u32::try_from(stored.attempt)
+            .context("database contains an invalid job attempt")?,
+        cancel_requested: stored.cancel_requested,
+        created_at: stored.created_at,
+        started_at: stored.started_at,
+        finished_at: stored.finished_at,
+        output_asset_id: stored.output_asset_id,
+        result,
+        error: stored.error,
+    })
+}
+
+fn render_request_digest(project_id: &str, revision: u64, preset_id: &str) -> Result<String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RequestDigest<'a> {
+        project_id: &'a str,
+        revision: u64,
+        preset_id: &'a str,
+    }
+    let bytes = serde_json::to_vec(&RequestDigest {
+        project_id,
+        revision,
+        preset_id,
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn retry_request_digest(source_job_id: &str) -> Result<String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RetryRequest<'a> {
+        source_job_id: &'a str,
+    }
+    let bytes = serde_json::to_vec(&RetryRequest { source_job_id })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn unix_time_seconds() -> Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    i64::try_from(duration.as_secs()).context("system clock is out of range")
+}
+
+fn truncate_error(error: &str, max_bytes: usize) -> String {
+    if error.len() <= max_bytes {
+        return error.to_owned();
+    }
+    let mut end = max_bytes;
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &error[..end])
 }
 
 pub struct RenderRevisionOptions {
@@ -350,6 +1152,21 @@ pub struct RenderRevisionOptions {
 }
 
 pub fn render_revision(options: RenderRevisionOptions) -> Result<RenderResult> {
+    render_revision_cancellable(options, None)
+}
+
+pub(crate) fn render_revision_cancellable(
+    options: RenderRevisionOptions,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<RenderResult> {
+    render_revision_with_preset_cancellable(options, RenderPreset::Export, cancellation)
+}
+
+pub(crate) fn render_revision_with_preset_cancellable(
+    options: RenderRevisionOptions,
+    preset: RenderPreset,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<RenderResult> {
     let store = ProjectStore::open(&options.database)?;
     let timeline_json = store.load_revision_json(&options.project_id, options.revision)?;
     let workspace = Workspace::open(&options.workspace)?;
@@ -365,15 +1182,19 @@ pub fn render_revision(options: RenderRevisionOptions) -> Result<RenderResult> {
     file.write_all(timeline_json.as_bytes())?;
     file.sync_all()?;
 
-    render_timeline(RenderOptions {
-        workspace: options.workspace,
-        timeline: timeline_path,
-        output: options.output,
-        ffmpeg: options.ffmpeg,
-        ffprobe: options.ffprobe,
-        font: options.font,
-        timeout_seconds: options.timeout_seconds,
-    })
+    crate::render::render_timeline_with_preset_cancellable(
+        RenderOptions {
+            workspace: options.workspace,
+            timeline: timeline_path,
+            output: options.output,
+            ffmpeg: options.ffmpeg,
+            ffprobe: options.ffprobe,
+            font: options.font,
+            timeout_seconds: options.timeout_seconds,
+        },
+        preset,
+        cancellation,
+    )
 }
 
 pub fn read_edit_request(path: &Path) -> Result<EditRequest> {
@@ -524,6 +1345,20 @@ fn edit_request_digest(expected_revision: u64, operations: &[EditOperation]) -> 
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+fn restore_request_digest(target_revision: u64, expected_revision: u64) -> Result<String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CanonicalRestoreRequest {
+        target_revision: u64,
+        expected_revision: u64,
+    }
+    let bytes = serde_json::to_vec(&CanonicalRestoreRequest {
+        target_revision,
+        expected_revision,
+    })?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 fn validate_project_id(project_id: &str) -> Result<()> {
     let parsed = Uuid::parse_str(project_id).context("projectId must be a UUID")?;
     if parsed.to_string() != project_id.to_ascii_lowercase() {
@@ -560,6 +1395,7 @@ impl Drop for RemoveTimelineOnDrop {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn text_update_is_typed_and_changes_only_requested_fields() {
@@ -598,5 +1434,107 @@ mod tests {
             "operations": [{"type": "clip.delete", "clipId": "x"}]
         }));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn version_one_database_migrates_to_render_jobs_without_losing_revisions() {
+        const PROJECT_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0a";
+        let root = tempdir().unwrap();
+        let database = root.path().join("projects.sqlite");
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(include_str!("../migrations/0001_initial.sql"))
+                .unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO projects (project_id, current_revision) VALUES (?1, 1)",
+                    [PROJECT_ID],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO revisions (project_id, revision, timeline_json) VALUES (?1, 1, '{}')",
+                    [PROJECT_ID],
+                )
+                .unwrap();
+        }
+
+        let store = ProjectStore::open(&database).unwrap();
+        assert_eq!(store.load_revision_json(PROJECT_ID, 1).unwrap(), "{}");
+        assert_eq!(
+            store
+                .connect()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))
+                .unwrap(),
+            DATABASE_VERSION
+        );
+        let queued = store
+            .enqueue_render_job(PROJECT_ID, 1, "export", "migrated-job")
+            .unwrap();
+        assert_eq!(queued.job.status, RenderJobStatus::Queued);
+    }
+
+    #[test]
+    fn version_two_successful_jobs_migrate_to_retrievable_render_assets() {
+        const PROJECT_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0a";
+        const JOB_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0d";
+        let root = tempdir().unwrap();
+        let database = root.path().join("projects.sqlite");
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(include_str!("../migrations/0001_initial.sql"))
+                .unwrap();
+            connection
+                .execute_batch(include_str!("../migrations/0002_render_jobs.sql"))
+                .unwrap();
+            connection.pragma_update(None, "user_version", 2).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO projects (project_id, current_revision) VALUES (?1, 1)",
+                    [PROJECT_ID],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO revisions (project_id, revision, timeline_json) VALUES (?1, 1, '{}')",
+                    [PROJECT_ID],
+                )
+                .unwrap();
+            let result = RenderResult {
+                output: root.path().join("renders/output.mp4"),
+                provenance: root.path().join("renders/output.mp4.provenance.json"),
+                timeline_sha256: "1".repeat(64),
+                output_sha256: "2".repeat(64),
+                output_duration_seconds: 1.0,
+                output_width: 320,
+                output_height: 240,
+                output_frame_count: 24,
+                output_frame_rate: "24/1".to_owned(),
+                video_codec: "h264".to_owned(),
+                audio_codec: None,
+            };
+            connection
+                .execute(
+                    "INSERT INTO render_jobs (job_id, project_id, revision, preset_id, idempotency_key, request_sha256, status, attempt, result_json) \
+                     VALUES (?1, ?2, 1, 'export', 'old-success', 'digest', 'succeeded', 1, ?3)",
+                    rusqlite::params![JOB_ID, PROJECT_ID, serde_json::to_string(&result).unwrap()],
+                )
+                .unwrap();
+        }
+
+        let store = ProjectStore::open(&database).unwrap();
+        let job = store.get_render_job(JOB_ID).unwrap();
+        assert_eq!(job.status, RenderJobStatus::Succeeded);
+        let asset_id = job.output_asset_id.unwrap();
+        let asset = store.get_render_asset(&asset_id).unwrap();
+        assert_eq!(asset.asset_id, asset_id);
+        assert_eq!(asset.job_id, JOB_ID);
+        assert_eq!(asset.attempt, 1);
+        assert_eq!(asset.output_sha256, "2".repeat(64));
+        assert_eq!(asset.preset_id, "export");
     }
 }
