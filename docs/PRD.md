@@ -49,6 +49,14 @@ A standalone AI-first video production platform where external autonomous agents
 | PR-014 | Interactive browser preview | P2 | Play/pause/seek, proxy media, overlays, stale-preview indicator; Release A provides rendered preview files instead |
 | PR-015 | Visual edits | P2 | Drag, trim, split, select, change properties, undo/redo |
 
+### 4.2 Intermediate editor boundary
+The first browser-editor increment targets practical, non-destructive editing without attempting a full NLE feature set:
+- Import and browse multiple local video/audio assets; create, reopen, and switch between local projects.
+- Edit one contiguous hard-cut video track, up to two audio tracks, and one title track. Support adding/removing clips, video reordering, clip split/trim, audio/title positioning, basic audio gain, and title text/style/position properties.
+- Keep every edit revisioned and validated through the same API operations used by other clients. Undo, redo, and history restore append revisions rather than mutating prior snapshots.
+- Display source preview as approximate for a multi-clip composition; use rendered preview output as the authoritative composite preview and label its revision.
+- Defer image/caption tracks, transitions, fades, effects, overlapping video layers, speed changes, synchronized proxy playback, TTS, MCP, collaboration, and remote rendering. This boundary is intentionally below Premiere/Resolve parity.
+
 ## 5. Supported media and limits
 - Eventual import targets: MP4/MOV video (H.264/H.265 where installed FFmpeg supports them), PNG/JPEG/WebP images, MP3/WAV/AAC audio. The first CLI build supports MP4/MOV video and MP3/WAV/AAC audio only; actual codec support is probed at runtime.
 - Output: MP4/H.264/AAC, 720p and 1080p, 24/25/30 fps; 30000/1001 is supported by the first CLI, and 60 fps is conditional on capability testing.

@@ -39,7 +39,7 @@ use crate::{
     ProjectRevision, ProjectRevisionHistory, ProjectStore, ProjectSummary, RenderJob, Workspace,
     jobs::{JobCancellationRegistry, RenderJobRunner},
     media::{MAX_IMPORT_BYTES, complete_uploaded_asset},
-    workspace::validate_asset_id,
+    workspace::{sanitize_media_file_name, validate_asset_id},
 };
 
 const MAX_API_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -130,6 +130,13 @@ struct RetryRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateUploadRequest {
     expected_bytes: u64,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +167,8 @@ struct CompleteUploadResponse {
 struct AssetMetadata {
     asset_id: String,
     kind: AssetKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_name: Option<String>,
     mime_type: String,
     sha256: String,
     bytes: u64,
@@ -173,6 +182,7 @@ struct AssetMetadata {
 struct ResolvedApiAsset {
     asset_id: String,
     kind: AssetKind,
+    file_name: Option<String>,
     mime_type: String,
     sha256: String,
     bytes: u64,
@@ -180,6 +190,12 @@ struct ResolvedApiAsset {
     filename: String,
     preset_id: Option<String>,
     probe: Option<MediaProbe>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssetListResponse {
+    assets: Vec<AssetMetadata>,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,7 +420,8 @@ fn build_router(
         uploads: UploadControl::default(),
     };
     Router::new()
-        .route("/v1/projects", post(create_project))
+        .route("/v1/health", get(get_health))
+        .route("/v1/projects", get(list_projects).post(create_project))
         .route("/v1/projects/{project_id}", get(get_project))
         .route("/v1/projects/{project_id}/timeline", get(get_timeline))
         .route(
@@ -424,6 +441,7 @@ fn build_router(
         .route("/v1/jobs/{job_id}/cancel", post(cancel_render_job))
         .route("/v1/jobs/{job_id}/retry", post(retry_render_job))
         .route("/v1/assets/uploads", post(create_asset_upload))
+        .route("/v1/assets", get(list_assets))
         .route(
             "/v1/assets/uploads/{upload_id}/content",
             put(put_asset_upload),
@@ -444,6 +462,45 @@ fn build_router(
             require_bearer,
         ))
         .with_state(state)
+}
+
+async fn get_health() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
+}
+
+async fn list_projects(
+    State(state): State<ApiState>,
+) -> std::result::Result<Json<Vec<ProjectSummary>>, ApiError> {
+    Ok(Json(state.store.list_project_summaries()?))
+}
+
+async fn list_assets(
+    State(state): State<ApiState>,
+) -> std::result::Result<Json<AssetListResponse>, ApiError> {
+    let workspace_path = state.workspace.clone();
+    let manifests =
+        tokio::task::spawn_blocking(move || Workspace::open(&workspace_path)?.list_assets())
+            .await
+            .map_err(|_| ApiError::internal("The asset library lookup did not complete"))??;
+    let assets = manifests
+        .into_iter()
+        .map(|manifest| AssetMetadata {
+            asset_id: manifest.asset_id.clone(),
+            kind: manifest.kind,
+            mime_type: media_mime_type(
+                manifest.kind,
+                manifest.file_name.as_deref(),
+                &manifest.probe.format_name,
+            ),
+            file_name: manifest.file_name,
+            sha256: manifest.sha256,
+            bytes: manifest.bytes,
+            content_url: format!("/v1/assets/{}/content", manifest.asset_id),
+            preset_id: None,
+            probe: Some(manifest.probe),
+        })
+        .collect();
+    Ok(Json(AssetListResponse { assets }))
 }
 
 async fn require_bearer(
@@ -680,6 +737,18 @@ async fn create_asset_upload(
             "uploads are limited to 2 GiB",
         ));
     }
+    let file_name = request
+        .file_name
+        .as_deref()
+        .map(sanitize_media_file_name)
+        .transpose()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "VALIDATION_FAILED",
+                "fileName must be a plain filename up to 255 bytes",
+            )
+        })?;
 
     let _creation_guard = state.uploads.creation_lock.lock().await;
     let workspace_path = state.workspace.clone();
@@ -722,7 +791,7 @@ async fn create_asset_upload(
     let upload_id = Uuid::new_v4().to_string();
     let created_id = upload_id.clone();
     tokio::task::spawn_blocking(move || {
-        workspace.create_upload_session(&created_id, request.expected_bytes)
+        workspace.create_upload_session(&created_id, request.expected_bytes, file_name)
     })
     .await
     .map_err(|_| ApiError::internal("The upload session worker did not complete"))??;
@@ -905,6 +974,7 @@ async fn complete_asset_upload(
                 sha256: manifest.sha256,
                 kind: manifest.kind,
                 bytes: manifest.bytes,
+                file_name: manifest.file_name,
                 probe: manifest.probe,
             })),
             Err(error) if format!("{error:#}").contains("ASSET_NOT_FOUND") => Ok(None),
@@ -1008,7 +1078,12 @@ fn resolve_api_asset(
             return Ok(ResolvedApiAsset {
                 asset_id: manifest.asset_id,
                 kind: manifest.kind,
-                mime_type: "application/octet-stream".to_owned(),
+                mime_type: media_mime_type(
+                    manifest.kind,
+                    manifest.file_name.as_deref(),
+                    &manifest.probe.format_name,
+                ),
+                file_name: manifest.file_name,
                 sha256: manifest.sha256.to_ascii_lowercase(),
                 bytes: manifest.bytes,
                 path,
@@ -1039,6 +1114,7 @@ fn resolve_api_asset(
     Ok(ResolvedApiAsset {
         asset_id: asset.asset_id,
         kind: AssetKind::Video,
+        file_name: None,
         mime_type: "video/mp4".to_owned(),
         sha256: asset.output_sha256.to_ascii_lowercase(),
         bytes: metadata.len(),
@@ -1047,6 +1123,28 @@ fn resolve_api_asset(
         preset_id: Some(asset.preset_id),
         probe: None,
     })
+}
+
+fn media_mime_type(kind: AssetKind, file_name: Option<&str>, format_name: &str) -> String {
+    let extension = file_name
+        .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime_type = match (kind, extension.as_str()) {
+        (AssetKind::Video, "mp4" | "m4v") => "video/mp4",
+        (AssetKind::Video, "mov") => "video/quicktime",
+        (AssetKind::Video, "mkv") => "video/x-matroska",
+        (AssetKind::Audio, "mp3") => "audio/mpeg",
+        (AssetKind::Audio, "wav") => "audio/wav",
+        (AssetKind::Audio, "aac") => "audio/aac",
+        (AssetKind::Audio, "m4a") => "audio/mp4",
+        (AssetKind::Video, _) if format_name.contains("matroska") => "video/x-matroska",
+        (AssetKind::Video, _) => "video/mp4",
+        (AssetKind::Audio, _) if format_name.contains("wav") => "audio/wav",
+        (AssetKind::Audio, _) if format_name.contains("mp3") => "audio/mpeg",
+        (AssetKind::Audio, _) => "audio/mp4",
+    };
+    mime_type.to_owned()
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -1061,6 +1159,7 @@ async fn get_asset_metadata(
     Ok(Json(AssetMetadata {
         asset_id: asset.asset_id.clone(),
         kind: asset.kind,
+        file_name: asset.file_name,
         mime_type: asset.mime_type,
         sha256: asset.sha256,
         bytes: asset.bytes,
@@ -1203,6 +1302,166 @@ mod tests {
     const TEST_TOKEN: &str = "local-test-token-0123456789abcdef012345";
 
     #[tokio::test]
+    async fn health_endpoint_reports_liveness_and_requires_authentication() {
+        let root = tempdir().unwrap();
+        let app = build_router(
+            ProjectStore::open(root.path().join("projects.sqlite")).unwrap(),
+            root.path().join("workspace"),
+            "ffprobe".into(),
+            TEST_TOKEN.to_owned(),
+            JobCancellationRegistry::default(),
+        );
+
+        let unauthorized = request(&app, Method::GET, "/v1/health", None, None).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = request(&app, Method::GET, "/v1/health", Some(TEST_TOKEN), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn editor_library_and_clip_operations_are_revisioned_and_idempotent() {
+        let root = tempdir().unwrap();
+        let workspace_path = root.path().join("workspace");
+        let workspace = Workspace::open(&workspace_path).unwrap();
+        install_video_fixture(&workspace, root.path());
+        let app = build_router(
+            ProjectStore::open(root.path().join("projects.sqlite")).unwrap(),
+            workspace_path.clone(),
+            "ffprobe".into(),
+            TEST_TOKEN.to_owned(),
+            JobCancellationRegistry::default(),
+        );
+
+        let unsafe_name = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": 1, "fileName": "../outside.wav"}).to_string()),
+        )
+        .await;
+        assert_eq!(unsafe_name.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let reservation = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": 1, "fileName": "voice.wav"}).to_string()),
+        )
+        .await;
+        assert_eq!(reservation.status(), StatusCode::CREATED);
+        let reservation: Value = response_json(reservation).await;
+        let upload_id = reservation["uploadId"].as_str().unwrap();
+        assert_eq!(
+            Workspace::open(&workspace_path)
+                .unwrap()
+                .load_upload_session(upload_id)
+                .unwrap()
+                .file_name
+                .as_deref(),
+            Some("voice.wav")
+        );
+        let cancelled = request(
+            &app,
+            Method::DELETE,
+            &format!("/v1/assets/uploads/{upload_id}"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+
+        let assets = request(&app, Method::GET, "/v1/assets", Some(TEST_TOKEN), None).await;
+        assert_eq!(assets.status(), StatusCode::OK);
+        let assets: Value = response_json(assets).await;
+        assert_eq!(assets["assets"].as_array().unwrap().len(), 1);
+        assert_eq!(assets["assets"][0]["fileName"], "fixture.mp4");
+        assert_eq!(assets["assets"][0]["mimeType"], "video/mp4");
+
+        let created = request(
+            &app,
+            Method::POST,
+            "/v1/projects",
+            Some(TEST_TOKEN),
+            Some(timeline_document().to_string()),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let projects = request(&app, Method::GET, "/v1/projects", Some(TEST_TOKEN), None).await;
+        assert_eq!(projects.status(), StatusCode::OK);
+        let projects: Value = response_json(projects).await;
+        assert_eq!(projects.as_array().unwrap().len(), 1);
+        assert_eq!(projects[0]["projectId"], PROJECT_ID);
+        assert_eq!(projects[0]["currentRevision"], 1);
+
+        let operations = json!({
+            "expectedRevision": 1,
+            "idempotencyKey": "editor-multiclip-batch",
+            "operations": [
+                {
+                    "type":"clip.add", "trackId":"video-main", "index":1,
+                    "clip":{
+                        "id":"video-second","kind":"video","assetId":ASSET_ID,
+                        "startFrame":24,"durationFrames":24,
+                        "sourceIn":{"ticks":0,"timebase_num":1,"timebase_den":1},
+                        "sourceOut":{"ticks":1,"timebase_num":1,"timebase_den":1}
+                    }
+                },
+                {"type":"clip.split","clipId":"video-second","splitFrame":36},
+                {"type":"clip.reorder","clipId":"picture","destinationIndex":2},
+                {
+                    "type":"clip.trim","clipId":"picture","startFrame":24,
+                    "durationFrames":12,
+                    "sourceIn":{"ticks":0,"timebase_num":1,"timebase_den":1},
+                    "sourceOut":{"ticks":500_000,"timebase_num":1,"timebase_den":1_000_000}
+                },
+                {"type":"clip.remove","clipId":"video-second"}
+            ]
+        });
+        let edit = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{PROJECT_ID}/operations"),
+            Some(TEST_TOKEN),
+            Some(operations.to_string()),
+        )
+        .await;
+        assert_eq!(edit.status(), StatusCode::OK);
+        let edit: Value = response_json(edit).await;
+        assert_eq!(edit["revision"], 2);
+        assert_eq!(edit["replayed"], false);
+
+        let replay = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{PROJECT_ID}/operations"),
+            Some(TEST_TOKEN),
+            Some(operations.to_string()),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await["replayed"], true);
+
+        let timeline = request(
+            &app,
+            Method::GET,
+            &format!("/v1/projects/{PROJECT_ID}/timeline"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(timeline.status(), StatusCode::OK);
+        let timeline: Value = response_json(timeline).await;
+        assert_eq!(timeline["revision"], 2);
+        assert_eq!(timeline["tracks"][0]["clips"].as_array().unwrap().len(), 2);
+        assert_eq!(timeline["tracks"][0]["clips"][1]["id"], "picture");
+        assert_eq!(timeline["tracks"][0]["clips"][1]["startFrame"], 12);
+    }
+
+    #[tokio::test]
     async fn uploads_survive_restart_and_are_bounded_validated_idempotent_and_downloadable() {
         let Some(ffmpeg) = configured_tool("STUDIO_TEST_FFMPEG", "ffmpeg") else {
             eprintln!("skipping media upload integration test: ffmpeg not found");
@@ -1321,7 +1580,10 @@ mod tests {
             Method::POST,
             "/v1/assets/uploads",
             Some(TEST_TOKEN),
-            Some(json!({"expectedBytes": source_bytes.len()}).to_string()),
+            Some(
+                json!({"expectedBytes": source_bytes.len(), "fileName": "uploaded.mp4"})
+                    .to_string(),
+            ),
         )
         .await;
         assert_eq!(created.status(), StatusCode::CREATED);
@@ -1370,6 +1632,7 @@ mod tests {
         assert_eq!(completed["replayed"], false);
         assert_eq!(completed["asset"]["assetId"], upload_id);
         assert_eq!(completed["asset"]["kind"], "video");
+        assert_eq!(completed["asset"]["fileName"], "uploaded.mp4");
         let expected_hash = hex::encode(Sha256::digest(&source_bytes));
         assert_eq!(completed["asset"]["sha256"], expected_hash);
 
@@ -1395,6 +1658,7 @@ mod tests {
         )
         .await;
         assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(download.headers()[CONTENT_TYPE], "video/mp4");
         let downloaded = to_bytes(download.into_body(), source_bytes.len() + 1)
             .await
             .unwrap();
@@ -2084,7 +2348,7 @@ mod tests {
         let source_metadata: Value = response_json(source_metadata).await;
         assert_eq!(source_metadata["assetId"], ASSET_ID);
         assert_eq!(source_metadata["kind"], "video");
-        assert_eq!(source_metadata["mimeType"], "application/octet-stream");
+        assert_eq!(source_metadata["mimeType"], "video/mp4");
         assert_eq!(source_metadata["bytes"], source_bytes.len());
         assert_eq!(
             source_metadata["sha256"],
@@ -2102,10 +2366,7 @@ mod tests {
         )
         .await;
         assert_eq!(source_content.status(), StatusCode::OK);
-        assert_eq!(
-            source_content.headers()[CONTENT_TYPE],
-            "application/octet-stream"
-        );
+        assert_eq!(source_content.headers()[CONTENT_TYPE], "video/mp4");
         let source_content = to_bytes(source_content.into_body(), 1024).await.unwrap();
         assert_eq!(&source_content[..], source_bytes);
 
@@ -2300,6 +2561,7 @@ mod tests {
             sha256: hex::encode(Sha256::digest(source)),
             bytes: source.len() as u64,
             kind: AssetKind::Video,
+            file_name: Some("fixture.mp4".to_owned()),
             probe: MediaProbe {
                 format_name: "mov,mp4".to_owned(),
                 duration: "1.0".to_owned(),

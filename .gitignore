@@ -1,3 +1,5 @@
 /target/
 /workspace/
 *.mp4.provenance.json
+apps/web-editor/node_modules/
+apps/web-editor/dist/

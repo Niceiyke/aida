@@ -79,6 +79,8 @@ This remains a partial Release A. It uses bundled SQLite through `rusqlite`; the
 - [ ] Extend persistence with API operation/audit records and concurrent-writer load tests; keep CLI and API mutations on the same application service.
 - [x] Add project revision history and idempotent restore as a new immutable revision.
 - [x] Add authenticated source-asset metadata and content endpoints with file-handle integrity verification.
+- [x] Add authenticated project and source-asset listings, retaining safe upload filenames for the browser media bin.
+- [x] Extend the shared typed operation executor with validated clip add/remove/move/reorder/trim/split; cover video, audio, and title splits in tests.
 - [x] Add SQLite-backed in-process export jobs with revision pinning, idempotent enqueue, one worker, cancellation, lease recovery after restart, atomic output publication, and status polling.
 - [x] Add output asset IDs and authenticated streaming retrieval for successful exports.
 - [x] Exercise upload -> project creation -> render job -> authenticated output download with checksum verification end to end.
@@ -111,14 +113,17 @@ This remains a partial Release A. It uses bundled SQLite through `rusqlite`; the
 
 ## 8. Phase 5 — React editor
 ### Tasks
-- [ ] Build media browser, thumbnail grid, preview monitor and proxy playback coordinator.
-- [ ] Build multitrack timeline, selection, drag, trim, split, zoom and scrubbing.
-- [ ] Add property inspector, title editor, audio gain and captions editing.
-- [ ] Integrate revision history, undo/redo, stale-preview warning and render progress.
-- [ ] Add accessible keyboard controls and error surfaces.
+- [x] Add a local React/Vite editor with authenticated API connection, multi-asset upload, media bin, saved project browser and project reopen.
+- [x] Build a single contiguous video lane, two audio lanes, title lane, selection, video drag-reorder, split, trim, move, add and remove controls.
+- [x] Add an inspector for source trims, audio gain, title text/style/position, and audio/title positioning.
+- [x] Integrate immutable revision history, undo/redo via restore, stale/approximate preview labels, render status, cancellation/retry and output download.
+- [ ] Add thumbnail/proxy generation, synchronized timeline playback/scrubbing and measured browser-to-export parity.
+- [x] Add accessible labels, visible focus states and API/error banners.
+- [ ] Add editor-specific keyboard shortcuts and automated browser editing journeys.
 ### Tests
-- Playwright editing journeys; browser timing tests; golden-frame comparison at cut/transition/caption boundaries, with measured parity thresholds.
-**Gate / Release C:** human corrects AI-created edit and exports it without editing JSON; stale or approximate preview is labelled.
+- [x] Rust API tests cover project/asset listing and revisioned clip-operation batches with idempotent replay.
+- [ ] Add Playwright editing journeys, browser timing tests and golden-frame comparison at supported edit boundaries.
+**Intermediate-editor gate:** a human can import multiple assets, edit the supported video/audio/title lanes, restore/undo/redo revisions, and export without editing JSON. Full Release C still requires synchronized proxy playback and preview/export parity evidence.
 
 ## 9. Phase 6 — production hardening
 - [ ] Improve subprocess sandboxing and deployment resource caps beyond the mandatory limits and path/URL protections already in phases 1–3.
@@ -147,6 +152,8 @@ For the first CLI build, tackle AVS-001–003 and AVS-006–009; AVS-004, AVS-00
 
 ## 11. Coding-agent task contract
 When delegating an issue to a coding agent, include objective, permitted modules, dependencies, input/output contracts, error semantics, test fixtures, acceptance commands and prohibited scope expansion. The project owner reviews API/schema changes and runs relevant checks; parallel agents must not independently invent timeline models or provider contracts. Solo development does not require agent handoff paperwork.
+
+For Windows checks in this workspace, FFmpeg is installed at `C:\ffmpeg-9.0.1-full_build-shared\bin\ffmpeg.exe` and ffprobe at `C:\ffmpeg-9.0.1-full_build-shared\bin\ffprobe.exe`; neither is on `PATH`. Set `STUDIO_TEST_FFMPEG`/`STUDIO_TEST_FFPROBE` for Rust tests and pass `--ffmpeg`/`--ffprobe` when starting the API. Text/title renders also need `--font 'C:\Windows\Fonts\arial.ttf'` here (see the README command).
 
 ### Sample agent task
 **AVS-005: Implement atomic operation executor**

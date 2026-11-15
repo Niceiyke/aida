@@ -74,6 +74,8 @@ pub struct ImportedAsset {
     pub sha256: String,
     pub kind: AssetKind,
     pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
     pub probe: MediaProbe,
 }
 
@@ -140,6 +142,10 @@ pub fn import_asset(options: ImportOptions) -> Result<ImportedAsset> {
         sha256: sha256.clone(),
         bytes,
         kind,
+        file_name: source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned),
         probe: probe.clone(),
     };
     workspace.write_asset_manifest(&staging, &manifest)?;
@@ -152,6 +158,7 @@ pub fn import_asset(options: ImportOptions) -> Result<ImportedAsset> {
         sha256,
         kind,
         bytes,
+        file_name: manifest.file_name,
         probe,
     })
 }
@@ -180,6 +187,7 @@ pub(crate) fn complete_uploaded_asset(
         sha256: sha256.clone(),
         bytes,
         kind,
+        file_name: session.file_name.clone(),
         probe: probe.clone(),
     };
     workspace.publish_upload_session(upload_id, &manifest)?;
@@ -189,6 +197,7 @@ pub(crate) fn complete_uploaded_asset(
         sha256,
         kind,
         bytes,
+        file_name: session.file_name,
         probe,
     })
 }

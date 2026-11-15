@@ -1,6 +1,6 @@
 # AI Video Studio
 
-Early local-first build of a headless video editor. The CLI stages local MP4/MOV video and MP3/WAV/AAC audio, validates JSON timelines against the bundled [`1.0.0` schema](schemas/timeline-1.0.0.schema.json), renders H.264/AAC MP4 with FFmpeg, writes provenance sidecars, and optionally stores projects and render jobs in SQLite. A small authenticated REST API is available on loopback; MCP and the browser editor are not implemented yet.
+Local-first video studio. The CLI stages media, validates JSON timelines against the bundled [`1.0.0` schema](schemas/timeline-1.0.0.schema.json), and renders H.264/AAC MP4 with FFmpeg. An authenticated loopback API and React editor support a local media bin, revisioned video/audio/title edits, preview/export jobs, and verified downloads. MCP and full NLE parity are not implemented.
 
 ## Requirements
 
@@ -8,6 +8,16 @@ Early local-first build of a headless video editor. The CLI stages local MP4/MOV
 - Recent `ffmpeg` and `ffprobe` on `PATH`, or pass their executable paths explicitly
 - An FFmpeg build with `libx264`, AAC, and `drawtext` support for text overlays
 - A `.ttf`, `.otf`, or `.ttc` font file when the timeline contains text
+- Node.js 18+ and npm to run the browser studio
+
+#### FFmpeg paths on this Windows workspace
+
+The installed FFmpeg tools are **not on `PATH`**. Use these executable paths when running tests or starting the API here:
+
+- `C:\ffmpeg-9.0.1-full_build-shared\bin\ffmpeg.exe`
+- `C:\ffmpeg-9.0.1-full_build-shared\bin\ffprobe.exe`
+
+`STUDIO_TEST_FFMPEG` and `STUDIO_TEST_FFPROBE` configure test discovery only. The API needs the `--ffmpeg` and `--ffprobe` CLI options as shown below. Timelines with title/text clips also require the API's `--font` option; this workspace has Arial at `C:\Windows\Fonts\arial.ttf`. On another machine, replace these with that machine's tool/font paths or put FFmpeg tools on `PATH`.
 
 ## Build and test
 
@@ -17,11 +27,13 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+Build the browser studio separately with `cd apps/web-editor; npm ci; npm run build`.
+
 The FFmpeg integration tests run when `ffmpeg` and `ffprobe` are on `PATH`. They cover synthetic H.264 and H.265/VFR media, portrait scaling, preview downscaling, a 70-second audio source, exact output frame count/rate, audio onset, failed-render cleanup, SQLite edit rollback/idempotency/restart rendering, job recovery/cancellation/retries/atomic publication, output asset streaming, and (on Unix) symlink rejection. H.265 is skipped when the installed FFmpeg has no `libx265` encoder. If the tools are elsewhere, set their paths (and optionally a font) before testing:
 
 ```powershell
-$env:STUDIO_TEST_FFMPEG = 'C:\tools\ffmpeg\bin\ffmpeg.exe'
-$env:STUDIO_TEST_FFPROBE = 'C:\tools\ffmpeg\bin\ffprobe.exe'
+$env:STUDIO_TEST_FFMPEG = 'C:\ffmpeg-9.0.1-full_build-shared\bin\ffmpeg.exe'
+$env:STUDIO_TEST_FFPROBE = 'C:\ffmpeg-9.0.1-full_build-shared\bin\ffprobe.exe'
 $env:STUDIO_TEST_FONT = 'C:\Windows\Fonts\arial.ttf'
 cargo test
 ```
@@ -89,7 +101,7 @@ The whole batch is validated and committed atomically. Reusing a key with the sa
   --output .\revision.mp4
 ```
 
-The database is local and single-user. The REST API exposes revision history and restore; equivalent CLI commands, MCP, and additional edit operation types remain future work.
+The database is local and single-user. The API and shared operation executor expose revision history/restore and typed clip, audio-gain, and title edits; MCP and audit records remain future work.
 
 ### Loopback REST API
 
@@ -100,8 +112,21 @@ $token = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
 $token # copy this value into the client terminal
 $env:STUDIO_API_TOKEN = $token
 .\target\release\studio.exe api serve --database .\workspace\projects.sqlite `
-  --workspace .\workspace
+  --workspace .\workspace `
+  --ffmpeg 'C:\ffmpeg-9.0.1-full_build-shared\bin\ffmpeg.exe' `
+  --ffprobe 'C:\ffmpeg-9.0.1-full_build-shared\bin\ffprobe.exe' `
+  --font 'C:\Windows\Fonts\arial.ttf'
 ```
+
+In a second terminal, start the React studio (install its dependencies once). The Vite proxy keeps browser requests same-origin while forwarding them to the loopback API:
+
+```powershell
+cd .\apps\web-editor
+npm ci
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`, paste the API token, and connect. Import multiple video/audio assets, then create a project from a video in the media bin or reopen a recent project. The editor supports one contiguous hard-cut video track, two audio tracks, and a title track: add/reorder/split/trim/remove clips, move audio/title clips, adjust audio gain and title properties, and undo/redo through immutable revisions. Queue a rendered preview or full-quality export and download the verified MP4 when the job succeeds. Source playback is labelled approximate for composite timelines; the rendered preview is authoritative for its revision. The token is held in browser session storage only; media, project data, and renders stay in the configured local workspace. Transitions, effects, captions/images, synchronized proxy playback, TTS, MCP, and collaboration remain deferred. For a different API port, set `VITE_API_TARGET` before `npm run dev`.
 
 Upload media directly instead of using `studio import`:
 
@@ -159,4 +184,4 @@ Upload sessions persist across server restarts but expire after 24 hours without
 - Local media only; imports are capped at 2 GiB. Render and probe subprocesses have timeouts and generated FFmpeg arguments; arbitrary filtergraph strings and remote URLs are not accepted.
 - Text requires a user-supplied local font. Fonts and media are untrusted inputs to native parsers; use files you trust.
 
-The local SQLite revision/edit/restore/render workflow, revision history, persisted export/preview jobs, source and render-output asset retrieval, bounded source-media uploads, retry routes, and loopback project/job API are initial Release A slices. MCP and the React editor are not implemented yet.
+The local SQLite revision/edit/restore/render workflow, revision history, persisted export/preview jobs, source and render-output asset retrieval, bounded source-media uploads, retry routes, and loopback project/job API are initial Release A slices. The React editor uses the same API operations for its supported intermediate timeline workflow. Full editor playback parity and MCP remain planned.

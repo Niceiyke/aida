@@ -22,6 +22,8 @@ struct UploadSessionManifest {
     schema_version: u32,
     upload_id: String,
     expected_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,7 @@ pub(crate) struct UploadSession {
     pub source: PathBuf,
     pub partial: PathBuf,
     pub expected_bytes: u64,
+    pub file_name: Option<String>,
     last_activity: SystemTime,
 }
 
@@ -48,6 +51,8 @@ pub struct AssetManifest {
     pub sha256: String,
     pub bytes: u64,
     pub kind: AssetKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
     pub probe: MediaProbe,
 }
 
@@ -217,7 +222,12 @@ impl Workspace {
         Ok(staging)
     }
 
-    pub(crate) fn create_upload_session(&self, id: &str, expected_bytes: u64) -> Result<()> {
+    pub(crate) fn create_upload_session(
+        &self,
+        id: &str,
+        expected_bytes: u64,
+        file_name: Option<String>,
+    ) -> Result<()> {
         validate_asset_id(id)?;
         if expected_bytes == 0 || expected_bytes > MAX_IMPORT_BYTES {
             bail!("upload size must be between 1 byte and 2 GiB");
@@ -230,6 +240,9 @@ impl Workspace {
             schema_version: 1,
             upload_id: id.to_owned(),
             expected_bytes,
+            file_name: file_name
+                .map(|name| sanitize_media_file_name(&name))
+                .transpose()?,
         };
         let result = (|| -> Result<()> {
             let path = directory.join(UPLOAD_SESSION_FILENAME);
@@ -307,6 +320,7 @@ impl Workspace {
             source,
             partial,
             expected_bytes: manifest.expected_bytes,
+            file_name: manifest.file_name,
             last_activity,
         })
     }
@@ -513,6 +527,62 @@ impl Workspace {
         }
         Ok((source, manifest))
     }
+
+    pub(crate) fn list_assets(&self) -> Result<Vec<AssetManifest>> {
+        let assets_metadata = fs::symlink_metadata(&self.assets)
+            .context("could not inspect workspace asset directory")?;
+        if assets_metadata.file_type().is_symlink() || !assets_metadata.is_dir() {
+            bail!("workspace asset path is not a safe directory");
+        }
+
+        let mut assets = Vec::new();
+        for entry in fs::read_dir(&self.assets).context("could not list workspace assets")? {
+            let entry = entry.context("could not read workspace asset entry")?;
+            let file_type = entry
+                .file_type()
+                .context("could not inspect workspace asset entry")?;
+            if file_type.is_symlink() {
+                bail!("workspace asset directory contains a symlink");
+            }
+            if !file_type.is_dir() {
+                bail!("workspace asset directory contains an unsafe entry");
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if id.starts_with(".import-") {
+                continue;
+            }
+            let (_, manifest) = self.load_asset(&id)?;
+            assets.push(manifest);
+        }
+        assets.sort_by(|left, right| {
+            left.file_name
+                .as_deref()
+                .unwrap_or(&left.asset_id)
+                .to_lowercase()
+                .cmp(
+                    &right
+                        .file_name
+                        .as_deref()
+                        .unwrap_or(&right.asset_id)
+                        .to_lowercase(),
+                )
+        });
+        Ok(assets)
+    }
+}
+
+pub(crate) fn sanitize_media_file_name(value: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty()
+        || name.len() > 255
+        || name.chars().any(char::is_control)
+        || name.contains(['/', '\\'])
+        || name == "."
+        || name == ".."
+    {
+        bail!("fileName must be a plain filename up to 255 bytes");
+    }
+    Ok(name.to_owned())
 }
 
 pub fn validate_asset_id(id: &str) -> Result<()> {
@@ -593,14 +663,29 @@ mod tests {
     }
 
     #[test]
+    fn media_file_names_are_plain_basenames_with_a_bounded_length() {
+        assert_eq!(
+            sanitize_media_file_name("  clip one.mp4  ").unwrap(),
+            "clip one.mp4"
+        );
+        assert!(sanitize_media_file_name("").is_err());
+        assert!(sanitize_media_file_name("../clip.mp4").is_err());
+        assert!(sanitize_media_file_name("folder\\clip.mp4").is_err());
+        assert!(sanitize_media_file_name(&"x".repeat(256)).is_err());
+        assert!(sanitize_media_file_name("clip\n.mp4").is_err());
+    }
+
+    #[test]
     fn upload_session_expiry_removes_stale_sessions_but_keeps_active_ones() {
         const ACTIVE_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0b";
         const STALE_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0c";
 
         let root = tempdir().unwrap();
         let workspace = Workspace::open(&root.path().join("workspace")).unwrap();
-        workspace.create_upload_session(ACTIVE_ID, 20).unwrap();
-        workspace.create_upload_session(STALE_ID, 10).unwrap();
+        workspace
+            .create_upload_session(ACTIVE_ID, 20, None)
+            .unwrap();
+        workspace.create_upload_session(STALE_ID, 10, None).unwrap();
 
         let now = SystemTime::now();
         let stale_session = workspace.load_upload_session(STALE_ID).unwrap();
@@ -707,6 +792,7 @@ mod tests {
             sha256: "0".repeat(64),
             bytes: 1,
             kind: AssetKind::Audio,
+            file_name: None,
             probe: MediaProbe {
                 format_name: "wav".to_owned(),
                 duration: "1.0".to_owned(),

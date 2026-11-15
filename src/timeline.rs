@@ -612,6 +612,46 @@ fn validate_source_range(
     Ok(())
 }
 
+pub(crate) fn source_timestamp_at_ratio(
+    source_in: &SourceTimestamp,
+    source_out: &SourceTimestamp,
+    numerator: u64,
+    denominator: u64,
+) -> Result<SourceTimestamp> {
+    if denominator == 0 || numerator == 0 || numerator >= denominator {
+        bail!("source split must lie strictly inside its clip range");
+    }
+    let start = timestamp_fraction(source_in)?;
+    let end = timestamp_fraction(source_out)?;
+    if compare(start, end)? != std::cmp::Ordering::Less {
+        bail!("sourceOut must be greater than sourceIn");
+    }
+    let span = subtract(end, start)?;
+    let numerator = span
+        .numerator
+        .checked_mul(i128::from(numerator))
+        .ok_or_else(|| anyhow::anyhow!("source split timestamp overflow"))?;
+    let denominator = span
+        .denominator
+        .checked_mul(i128::from(denominator))
+        .ok_or_else(|| anyhow::anyhow!("source split time base overflow"))?;
+    let offset = Fraction::new(numerator, denominator)?;
+    let position = add(start, offset)?;
+    let scaled = position
+        .numerator
+        .checked_mul(1_000_000)
+        .ok_or_else(|| anyhow::anyhow!("source split timestamp overflow"))?;
+    let rounded = scaled
+        .checked_add(position.denominator / 2)
+        .ok_or_else(|| anyhow::anyhow!("source split timestamp overflow"))?
+        / position.denominator;
+    Ok(SourceTimestamp {
+        ticks: i64::try_from(rounded).context("source split timestamp is out of range")?,
+        timebase_num: 1,
+        timebase_den: 1_000_000,
+    })
+}
+
 fn resolve_assets(
     timeline_assets: &BTreeMap<String, TimelineAsset>,
     workspace: &Workspace,
@@ -829,6 +869,29 @@ mod tests {
     }
 
     #[test]
+    fn source_timestamp_interpolation_preserves_rational_ranges() {
+        let split = source_timestamp_at_ratio(
+            &SourceTimestamp {
+                ticks: 500,
+                timebase_num: 1,
+                timebase_den: 1_000,
+            },
+            &SourceTimestamp {
+                ticks: 2_500,
+                timebase_num: 1,
+                timebase_den: 1_000,
+            },
+            1,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(split.ticks, 1_500_000);
+        assert_eq!(split.timebase_num, 1);
+        assert_eq!(split.timebase_den, 1_000_000);
+    }
+
+    #[test]
     fn source_duration_must_fit_both_media_and_project_frames() {
         let asset = AssetManifest {
             schema_version: 1,
@@ -836,6 +899,7 @@ mod tests {
             sha256: "0".repeat(64),
             bytes: 1,
             kind: AssetKind::Video,
+            file_name: None,
             probe: crate::media::MediaProbe {
                 format_name: "mp4".to_owned(),
                 duration: "3.000000".to_owned(),

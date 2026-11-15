@@ -16,7 +16,8 @@ use crate::{
     RenderOptions, RenderResult,
     render::RenderPreset,
     timeline::{
-        Clip, TextClip, Timeline, TrackKind, ValidatedTimeline, load_and_validate, validate,
+        AudioClip, Clip, SourceTimestamp, TextClip, Timeline, TimelineAsset, Track, TrackKind,
+        ValidatedTimeline, VideoClip, load_and_validate, source_timestamp_at_ratio, validate,
         validate_json_document,
     },
     workspace::Workspace,
@@ -39,6 +40,53 @@ pub struct EditRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum EditOperation {
+    #[serde(rename = "clip.add")]
+    ClipAdd {
+        #[serde(rename = "trackId")]
+        track_id: String,
+        clip: Clip,
+        #[serde(default)]
+        index: Option<usize>,
+    },
+    #[serde(rename = "clip.remove")]
+    ClipRemove {
+        #[serde(rename = "clipId")]
+        clip_id: String,
+    },
+    #[serde(rename = "clip.move")]
+    ClipMove {
+        #[serde(rename = "clipId")]
+        clip_id: String,
+        #[serde(rename = "startFrame")]
+        start_frame: u64,
+    },
+    #[serde(rename = "clip.reorder")]
+    ClipReorder {
+        #[serde(rename = "clipId")]
+        clip_id: String,
+        #[serde(rename = "destinationIndex")]
+        destination_index: usize,
+    },
+    #[serde(rename = "clip.trim")]
+    ClipTrim {
+        #[serde(rename = "clipId")]
+        clip_id: String,
+        #[serde(rename = "startFrame")]
+        start_frame: u64,
+        #[serde(rename = "durationFrames")]
+        duration_frames: u64,
+        #[serde(default, rename = "sourceIn")]
+        source_in: Option<SourceTimestamp>,
+        #[serde(default, rename = "sourceOut")]
+        source_out: Option<SourceTimestamp>,
+    },
+    #[serde(rename = "clip.split")]
+    ClipSplit {
+        #[serde(rename = "clipId")]
+        clip_id: String,
+        #[serde(rename = "splitFrame")]
+        split_frame: u64,
+    },
     #[serde(rename = "text.update")]
     TextUpdate {
         #[serde(rename = "clipId")]
@@ -74,6 +122,8 @@ pub struct ProjectRevision {
 pub struct ProjectSummary {
     pub project_id: String,
     pub current_revision: u64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -286,6 +336,7 @@ impl ProjectStore {
             bail!("edit batch must contain between 1 and 100 operations");
         }
 
+        let workspace = Workspace::open(workspace_path)?;
         let request_sha256 = edit_request_digest(expected_revision, operations)?;
         to_sql_revision(expected_revision)?;
         let mut connection = self.connect()?;
@@ -334,13 +385,12 @@ impl ProjectStore {
         )?;
         let mut timeline: Timeline =
             serde_json::from_str(&current_json).context("stored project timeline is invalid")?;
-        apply_operations(&mut timeline, operations)?;
+        apply_operations(&mut timeline, operations, &workspace)?;
 
         let next_revision = current_revision
             .checked_add(1)
             .ok_or_else(|| anyhow!("project revision overflow"))?;
         timeline.revision = next_revision;
-        let workspace = Workspace::open(workspace_path)?;
         let validated = validate(timeline, &workspace)?;
         let timeline_json = serde_json::to_string(&validated.timeline)?;
         let next_sql = to_sql_revision(next_revision)?;
@@ -527,19 +577,61 @@ impl ProjectStore {
 
     pub fn get_project_summary(&self, project_id: &str) -> Result<ProjectSummary> {
         validate_project_id(project_id)?;
-        let current_revision = self
+        let summary = self
             .connect()?
             .query_row(
-                "SELECT current_revision FROM projects WHERE project_id = ?1",
+                "SELECT projects.current_revision, projects.created_at, revisions.created_at \
+                 FROM projects JOIN revisions \
+                   ON revisions.project_id = projects.project_id \
+                  AND revisions.revision = projects.current_revision \
+                 WHERE projects.project_id = ?1",
                 [project_id],
-                |row| row.get::<_, i64>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(|| anyhow!("PROJECT_NOT_FOUND: project {project_id} does not exist"))?;
         Ok(ProjectSummary {
             project_id: project_id.to_owned(),
-            current_revision: from_sql_revision(current_revision)?,
+            current_revision: from_sql_revision(summary.0)?,
+            created_at: summary.1,
+            updated_at: summary.2,
         })
+    }
+
+    pub fn list_project_summaries(&self) -> Result<Vec<ProjectSummary>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare(
+            "SELECT projects.project_id, projects.current_revision, projects.created_at, revisions.created_at \
+             FROM projects JOIN revisions \
+               ON revisions.project_id = projects.project_id \
+              AND revisions.revision = projects.current_revision \
+             ORDER BY revisions.created_at DESC, projects.project_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut projects = Vec::new();
+        for row in rows {
+            let (project_id, current_revision, created_at, updated_at) = row?;
+            projects.push(ProjectSummary {
+                project_id,
+                current_revision: from_sql_revision(current_revision)?,
+                created_at,
+                updated_at,
+            });
+        }
+        Ok(projects)
     }
 
     pub fn load_current_revision_json(&self, project_id: &str) -> Result<(u64, String)> {
@@ -1214,9 +1306,215 @@ pub fn read_edit_request(path: &Path) -> Result<EditRequest> {
     Ok(request)
 }
 
-fn apply_operations(timeline: &mut Timeline, operations: &[EditOperation]) -> Result<()> {
+fn apply_operations(
+    timeline: &mut Timeline,
+    operations: &[EditOperation],
+    workspace: &Workspace,
+) -> Result<()> {
     for (index, operation) in operations.iter().enumerate() {
         match operation {
+            EditOperation::ClipAdd {
+                track_id,
+                clip,
+                index: insert_at,
+            } => {
+                let track_index = timeline
+                    .tracks
+                    .iter()
+                    .position(|track| track.id == *track_id)
+                    .ok_or_else(|| {
+                        anyhow!("operation {} track {track_id} was not found", index + 1)
+                    })?;
+                let track = &timeline.tracks[track_index];
+                if track.locked {
+                    bail!(
+                        "operation {} cannot edit locked track {}",
+                        index + 1,
+                        track.id
+                    );
+                }
+                if !clip_matches_track(clip, track.kind) {
+                    bail!(
+                        "operation {} clip kind does not match track {}",
+                        index + 1,
+                        track_id
+                    );
+                }
+                let insert_at = insert_at.unwrap_or(track.clips.len());
+                if insert_at > track.clips.len() {
+                    bail!("operation {} insertion index is out of range", index + 1);
+                }
+
+                if let Some(asset_id) = clip_asset_id(clip) {
+                    let (_, manifest) = workspace.load_asset(asset_id)?;
+                    let timeline_asset = TimelineAsset {
+                        kind: manifest.kind,
+                        uri: format!("asset://{asset_id}"),
+                        sha256: manifest.sha256,
+                    };
+                    match timeline.assets.get(asset_id) {
+                        Some(existing)
+                            if existing.kind != timeline_asset.kind
+                                || existing.sha256 != timeline_asset.sha256 =>
+                        {
+                            bail!("operation {} asset manifest changed", index + 1);
+                        }
+                        Some(_) => {}
+                        None => {
+                            timeline.assets.insert(asset_id.to_owned(), timeline_asset);
+                        }
+                    }
+                }
+
+                let track = &mut timeline.tracks[track_index];
+                if track.kind == TrackKind::Video {
+                    sort_video_clips(track);
+                }
+                let insert_at = insert_at.min(track.clips.len());
+                track.clips.insert(insert_at, clip.clone());
+                if track.kind == TrackKind::Video {
+                    reflow_video_track(track)?;
+                }
+            }
+            EditOperation::ClipRemove { clip_id } => {
+                let (track_index, clip_index) = find_clip_position(timeline, clip_id)?;
+                let track = &mut timeline.tracks[track_index];
+                if track.locked {
+                    bail!(
+                        "operation {} cannot edit locked track {}",
+                        index + 1,
+                        track.id
+                    );
+                }
+                track.clips.remove(clip_index);
+                if track.kind == TrackKind::Video {
+                    sort_video_clips(track);
+                    reflow_video_track(track)?;
+                }
+            }
+            EditOperation::ClipMove {
+                clip_id,
+                start_frame,
+            } => {
+                let (track_index, clip_index) = find_clip_position(timeline, clip_id)?;
+                let track = &mut timeline.tracks[track_index];
+                if track.locked {
+                    bail!(
+                        "operation {} cannot edit locked track {}",
+                        index + 1,
+                        track.id
+                    );
+                }
+                match &mut track.clips[clip_index] {
+                    Clip::Video(_) => bail!(
+                        "operation {} video clips must be reordered on the contiguous video track",
+                        index + 1
+                    ),
+                    Clip::Audio(clip) => clip.start_frame = *start_frame,
+                    Clip::Text(clip) => clip.start_frame = *start_frame,
+                    Clip::Caption(_) | Clip::Image(_) => {
+                        bail!("operation {} targets an unsupported clip", index + 1)
+                    }
+                }
+            }
+            EditOperation::ClipReorder {
+                clip_id,
+                destination_index,
+            } => {
+                let (track_index, clip_index) = find_clip_position(timeline, clip_id)?;
+                let track = &mut timeline.tracks[track_index];
+                if track.kind != TrackKind::Video
+                    || !matches!(track.clips[clip_index], Clip::Video(_))
+                {
+                    bail!("operation {} clip.reorder targets a video clip", index + 1);
+                }
+                if track.locked {
+                    bail!(
+                        "operation {} cannot edit locked track {}",
+                        index + 1,
+                        track.id
+                    );
+                }
+                sort_video_clips(track);
+                let clip_index = track
+                    .clips
+                    .iter()
+                    .position(|clip| matches!(clip, Clip::Video(video) if video.id == *clip_id))
+                    .expect("validated video clip remains in its track");
+                if *destination_index >= track.clips.len() {
+                    bail!("operation {} destination index is out of range", index + 1);
+                }
+                let clip = track.clips.remove(clip_index);
+                track.clips.insert(*destination_index, clip);
+                reflow_video_track(track)?;
+            }
+            EditOperation::ClipTrim {
+                clip_id,
+                start_frame,
+                duration_frames,
+                source_in,
+                source_out,
+            } => {
+                let (track_index, clip_index) = find_clip_position(timeline, clip_id)?;
+                let track = &mut timeline.tracks[track_index];
+                if track.locked {
+                    bail!(
+                        "operation {} cannot edit locked track {}",
+                        index + 1,
+                        track.id
+                    );
+                }
+                match &mut track.clips[clip_index] {
+                    Clip::Video(clip) => {
+                        if *start_frame != clip.start_frame {
+                            bail!(
+                                "operation {} cannot create gaps on the contiguous video track",
+                                index + 1
+                            );
+                        }
+                        set_source_range(clip_id, source_in, source_out, index)?;
+                        clip.duration_frames = *duration_frames;
+                        clip.source_in = source_in.clone().expect("checked source range");
+                        clip.source_out = source_out.clone().expect("checked source range");
+                        reflow_video_track(track)?;
+                    }
+                    Clip::Audio(clip) => {
+                        set_source_range(clip_id, source_in, source_out, index)?;
+                        clip.start_frame = *start_frame;
+                        clip.duration_frames = *duration_frames;
+                        clip.source_in = source_in.clone().expect("checked source range");
+                        clip.source_out = source_out.clone().expect("checked source range");
+                    }
+                    Clip::Text(clip) => {
+                        if source_in.is_some() || source_out.is_some() {
+                            bail!(
+                                "operation {} text clips do not have source ranges",
+                                index + 1
+                            );
+                        }
+                        clip.start_frame = *start_frame;
+                        clip.duration_frames = *duration_frames;
+                    }
+                    Clip::Caption(_) | Clip::Image(_) => {
+                        bail!("operation {} targets an unsupported clip", index + 1)
+                    }
+                }
+            }
+            EditOperation::ClipSplit {
+                clip_id,
+                split_frame,
+            } => {
+                let (track_index, clip_index) = find_clip_position(timeline, clip_id)?;
+                let track = &mut timeline.tracks[track_index];
+                if track.locked {
+                    bail!(
+                        "operation {} cannot edit locked track {}",
+                        index + 1,
+                        track.id
+                    );
+                }
+                split_clip(track, clip_index, *split_frame)?;
+            }
             EditOperation::TextUpdate {
                 clip_id,
                 text,
@@ -1301,6 +1599,172 @@ fn apply_operations(timeline: &mut Timeline, operations: &[EditOperation]) -> Re
                     );
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn clip_matches_track(clip: &Clip, track_kind: TrackKind) -> bool {
+    matches!(
+        (track_kind, clip),
+        (TrackKind::Video, Clip::Video(_))
+            | (TrackKind::Audio, Clip::Audio(_))
+            | (TrackKind::Overlay, Clip::Text(_))
+    )
+}
+
+fn clip_asset_id(clip: &Clip) -> Option<&str> {
+    match clip {
+        Clip::Video(clip) => Some(&clip.asset_id),
+        Clip::Audio(clip) => Some(&clip.asset_id),
+        Clip::Text(_) | Clip::Caption(_) | Clip::Image(_) => None,
+    }
+}
+
+fn find_clip_position(timeline: &Timeline, clip_id: &str) -> Result<(usize, usize)> {
+    timeline
+        .tracks
+        .iter()
+        .enumerate()
+        .find_map(|(track_index, track)| {
+            track
+                .clips
+                .iter()
+                .position(|clip| clip_id_of(clip) == clip_id)
+                .map(|clip_index| (track_index, clip_index))
+        })
+        .ok_or_else(|| anyhow!("clip {clip_id} was not found"))
+}
+
+fn clip_id_of(clip: &Clip) -> &str {
+    match clip {
+        Clip::Video(clip) => &clip.id,
+        Clip::Audio(clip) => &clip.id,
+        Clip::Text(clip) => &clip.id,
+        Clip::Caption(clip) => &clip.id,
+        Clip::Image(clip) => &clip.id,
+    }
+}
+
+fn sort_video_clips(track: &mut Track) {
+    track.clips.sort_by_key(Clip::start_frame);
+}
+
+fn reflow_video_track(track: &mut Track) -> Result<()> {
+    let mut cursor = 0_u64;
+    for clip in &mut track.clips {
+        let Clip::Video(video) = clip else {
+            bail!("video tracks may contain only video clips");
+        };
+        video.start_frame = cursor;
+        cursor = cursor
+            .checked_add(video.duration_frames)
+            .context("video track frame position overflowed")?;
+    }
+    Ok(())
+}
+
+fn set_source_range(
+    clip_id: &str,
+    source_in: &Option<SourceTimestamp>,
+    source_out: &Option<SourceTimestamp>,
+    operation_index: usize,
+) -> Result<()> {
+    if source_in.is_none() || source_out.is_none() {
+        bail!(
+            "operation {} clip.trim for {clip_id} requires sourceIn and sourceOut",
+            operation_index + 1
+        );
+    }
+    Ok(())
+}
+
+fn split_clip(track: &mut Track, clip_index: usize, split_frame: u64) -> Result<()> {
+    let clip = track.clips[clip_index].clone();
+    let start_frame = clip.start_frame();
+    let end_frame = start_frame
+        .checked_add(clip.duration_frames())
+        .context("clip frame range overflowed")?;
+    if split_frame <= start_frame || split_frame >= end_frame {
+        bail!("splitFrame must be inside the selected clip");
+    }
+    let first_duration = split_frame - start_frame;
+    let second_duration = end_frame - split_frame;
+    let second_id = Uuid::new_v4().to_string();
+
+    match clip {
+        Clip::Video(mut first) => {
+            if track.kind != TrackKind::Video {
+                bail!("video clips must be on a video track");
+            }
+            let source_split = source_timestamp_at_ratio(
+                &first.source_in,
+                &first.source_out,
+                first_duration,
+                first.duration_frames,
+            )?;
+            let original_source_out = first.source_out.clone();
+            first.duration_frames = first_duration;
+            first.source_out = source_split.clone();
+            let second = VideoClip {
+                id: second_id,
+                asset_id: first.asset_id.clone(),
+                start_frame: split_frame,
+                duration_frames: second_duration,
+                source_in: source_split,
+                source_out: original_source_out,
+                transform: first.transform.clone(),
+                effects: first.effects.clone(),
+            };
+            track.clips[clip_index] = Clip::Video(first);
+            track.clips.insert(clip_index + 1, Clip::Video(second));
+            reflow_video_track(track)?;
+        }
+        Clip::Audio(mut first) => {
+            if track.kind != TrackKind::Audio {
+                bail!("audio clips must be on an audio track");
+            }
+            let source_split = source_timestamp_at_ratio(
+                &first.source_in,
+                &first.source_out,
+                first_duration,
+                first.duration_frames,
+            )?;
+            let original_source_out = first.source_out.clone();
+            first.duration_frames = first_duration;
+            first.source_out = source_split.clone();
+            let second = AudioClip {
+                id: second_id,
+                asset_id: first.asset_id.clone(),
+                start_frame: split_frame,
+                duration_frames: second_duration,
+                source_in: source_split,
+                source_out: original_source_out,
+                gain: first.gain,
+            };
+            track.clips[clip_index] = Clip::Audio(first);
+            track.clips.insert(clip_index + 1, Clip::Audio(second));
+        }
+        Clip::Text(mut first) => {
+            if track.kind != TrackKind::Overlay {
+                bail!("text clips must be on an overlay track");
+            }
+            first.duration_frames = first_duration;
+            let second = TextClip {
+                id: second_id,
+                start_frame: split_frame,
+                duration_frames: second_duration,
+                text: first.text.clone(),
+                font_size: first.font_size,
+                color: first.color.clone(),
+                x: first.x,
+                y: first.y,
+            };
+            track.clips[clip_index] = Clip::Text(first);
+            track.clips.insert(clip_index + 1, Clip::Text(second));
+        }
+        Clip::Caption(_) | Clip::Image(_) => {
+            bail!("captions and images cannot be split by the first renderer")
         }
     }
     Ok(())
@@ -1394,6 +1858,8 @@ impl Drop for RemoveTimelineOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::{AssetKind, MediaProbe, StreamInfo};
+    use crate::workspace::AssetManifest;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1418,7 +1884,9 @@ mod tests {
         }))
         .unwrap();
 
-        apply_operations(&mut timeline, &[operation]).unwrap();
+        let root = tempdir().unwrap();
+        let workspace = Workspace::open(&root.path().join("workspace")).unwrap();
+        apply_operations(&mut timeline, &[operation], &workspace).unwrap();
         let Clip::Text(clip) = &timeline.tracks[1].clips[0] else {
             panic!("expected text clip");
         };
@@ -1434,6 +1902,184 @@ mod tests {
             "operations": [{"type": "clip.delete", "clipId": "x"}]
         }));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn timeline_clip_operations_add_split_trim_move_reorder_and_remove_atomically() {
+        const VIDEO_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0b";
+        const AUDIO_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0c";
+        let root = tempdir().unwrap();
+        let workspace = Workspace::open(&root.path().join("workspace")).unwrap();
+        let video_manifest = write_test_asset(
+            &workspace,
+            VIDEO_ID,
+            AssetKind::Video,
+            MediaProbe {
+                format_name: "mp4".to_owned(),
+                duration: "1.000000".to_owned(),
+                duration_seconds: 1.0,
+                has_video: true,
+                has_audio: false,
+                video: Some(StreamInfo {
+                    codec: "h264".to_owned(),
+                    duration_seconds: Some(1.0),
+                    frame_rate: Some("24/1".to_owned()),
+                    width: Some(640),
+                    height: Some(360),
+                    sample_rate: None,
+                    channels: None,
+                }),
+                audio: None,
+            },
+        );
+        let _audio_manifest = write_test_asset(
+            &workspace,
+            AUDIO_ID,
+            AssetKind::Audio,
+            MediaProbe {
+                format_name: "wav".to_owned(),
+                duration: "1.000000".to_owned(),
+                duration_seconds: 1.0,
+                has_video: false,
+                has_audio: true,
+                video: None,
+                audio: Some(StreamInfo {
+                    codec: "pcm_s16le".to_owned(),
+                    duration_seconds: Some(1.0),
+                    frame_rate: None,
+                    width: None,
+                    height: None,
+                    sample_rate: Some(48_000),
+                    channels: Some(2),
+                }),
+            },
+        );
+
+        let mut document: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/timeline-schema-valid.json"))
+                .unwrap();
+        document["assets"][VIDEO_ID]["sha256"] = json!(video_manifest.sha256);
+        document["tracks"].as_array_mut().unwrap().extend([
+            json!({"id":"audio-1","kind":"audio","order":1,"clips":[]}),
+            json!({"id":"audio-2","kind":"audio","order":2,"clips":[]}),
+            json!({"id":"titles","kind":"overlay","order":3,"clips":[]}),
+        ]);
+        let mut timeline: Timeline = serde_json::from_value(document).unwrap();
+
+        let operations = vec![
+            serde_json::from_value(json!({
+                "type":"clip.add", "trackId":"video-main", "index":0,
+                "clip":{
+                    "id":"second-shot","kind":"video","assetId":VIDEO_ID,
+                    "startFrame":0,"durationFrames":12,
+                    "sourceIn":{"ticks":0,"timebase_num":1,"timebase_den":1},
+                    "sourceOut":{"ticks":500_000,"timebase_num":1,"timebase_den":1_000_000}
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.split", "clipId":"second-shot", "splitFrame":6
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.reorder", "clipId":"clip-1", "destinationIndex":0
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.trim", "clipId":"clip-1", "startFrame":0,
+                "durationFrames":12,
+                "sourceIn":{"ticks":0,"timebase_num":1,"timebase_den":1},
+                "sourceOut":{"ticks":500_000,"timebase_num":1,"timebase_den":1_000_000}
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.add", "trackId":"audio-1",
+                "clip":{
+                    "id":"music","kind":"audio","assetId":AUDIO_ID,
+                    "startFrame":0,"durationFrames":24,
+                    "sourceIn":{"ticks":0,"timebase_num":1,"timebase_den":1},
+                    "sourceOut":{"ticks":1,"timebase_num":1,"timebase_den":1},"gain":1.0
+                }
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.trim", "clipId":"music", "startFrame":5,
+                "durationFrames":12,
+                "sourceIn":{"ticks":250_000,"timebase_num":1,"timebase_den":1_000_000},
+                "sourceOut":{"ticks":750_000,"timebase_num":1,"timebase_den":1_000_000}
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.split", "clipId":"music", "splitFrame":11
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"audio.gain.set", "clipId":"music", "gain":0.5
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.add", "trackId":"titles",
+                "clip":{"id":"title","kind":"text","startFrame":0,"durationFrames":18,
+                    "text":"Avida","fontSize":48,"color":"#FFFFFF","x":20,"y":30}
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.split", "clipId":"title", "splitFrame":9
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.move", "clipId":"title", "startFrame":3
+            }))
+            .unwrap(),
+            serde_json::from_value(json!({
+                "type":"clip.remove", "clipId":"second-shot"
+            }))
+            .unwrap(),
+        ];
+
+        apply_operations(&mut timeline, &operations, &workspace).unwrap();
+        let validated = validate(timeline, &workspace).unwrap();
+        assert_eq!(validated.total_frames, 18);
+        assert_eq!(validated.timeline.assets.len(), 2);
+        let videos = &validated.timeline.tracks[0].clips;
+        assert_eq!(videos.len(), 2);
+        assert!(
+            matches!(&videos[0], Clip::Video(video) if video.id == "clip-1" && video.duration_frames == 12)
+        );
+        assert_eq!(validated.timeline.tracks[1].clips.len(), 2);
+        assert!(
+            matches!(&validated.timeline.tracks[1].clips[0], Clip::Audio(audio) if audio.gain == 0.5)
+        );
+        assert_eq!(validated.timeline.tracks[3].clips.len(), 2);
+    }
+
+    fn write_test_asset(
+        workspace: &Workspace,
+        asset_id: &str,
+        kind: AssetKind,
+        probe: MediaProbe,
+    ) -> AssetManifest {
+        use sha2::{Digest, Sha256};
+
+        let bytes = format!("test asset {asset_id}").into_bytes();
+        let directory = workspace.root().join("assets").join(asset_id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(crate::workspace::SOURCE_FILENAME), &bytes).unwrap();
+        let manifest = AssetManifest {
+            schema_version: 1,
+            asset_id: asset_id.to_owned(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            bytes: bytes.len() as u64,
+            kind,
+            file_name: Some(format!("{asset_id}.media")),
+            probe,
+        };
+        fs::write(
+            directory.join("asset.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest
     }
 
     #[test]
