@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Weak},
+    time::SystemTime,
+};
 
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -16,20 +22,23 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::{
-    AssetKind, EditOperation, EditResult, MediaProbe, ProjectRestoreResult, ProjectRevision,
-    ProjectRevisionHistory, ProjectStore, ProjectSummary, RenderJob, Workspace,
+    AssetKind, EditOperation, EditResult, ImportedAsset, MediaProbe, ProjectRestoreResult,
+    ProjectRevision, ProjectRevisionHistory, ProjectStore, ProjectSummary, RenderJob, Workspace,
     jobs::{JobCancellationRegistry, RenderJobRunner},
+    media::{MAX_IMPORT_BYTES, complete_uploaded_asset},
     workspace::validate_asset_id,
 };
 
@@ -52,8 +61,34 @@ pub struct ApiServerOptions {
 struct ApiState {
     store: ProjectStore,
     workspace: PathBuf,
+    ffprobe: PathBuf,
     cancellation: JobCancellationRegistry,
+    uploads: UploadControl,
 }
+
+#[derive(Clone, Default)]
+struct UploadControl {
+    creation_lock: Arc<tokio::sync::Mutex<()>>,
+    session_locks: Arc<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl UploadControl {
+    fn session_lock(&self, upload_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .session_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(upload_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(upload_id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
+const MAX_CONCURRENT_UPLOADS: usize = 4;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -89,6 +124,35 @@ struct RenderRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RetryRequest {
     idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateUploadRequest {
+    expected_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadSessionResponse {
+    upload_id: String,
+    expected_bytes: u64,
+    upload_url: String,
+    complete_url: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadReceivedResponse {
+    upload_id: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompleteUploadResponse {
+    asset: ImportedAsset,
+    replayed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +213,15 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn new(status: StatusCode, code: &str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: code.to_owned(),
+            message: message.into(),
+            current_revision: None,
+        }
+    }
+
     fn from_anyhow(error: anyhow::Error) -> Self {
         let details = format!("{error:#}");
         let (status, code, message) = if details.contains("REVISION_CONFLICT") {
@@ -165,6 +238,8 @@ impl ApiError {
             (StatusCode::NOT_FOUND, "JOB_NOT_FOUND", details)
         } else if details.contains("ASSET_NOT_FOUND") {
             (StatusCode::NOT_FOUND, "ASSET_NOT_FOUND", details)
+        } else if details.contains("UPLOAD_NOT_FOUND") {
+            (StatusCode::NOT_FOUND, "UPLOAD_NOT_FOUND", details)
         } else if details.contains("JOB_NOT_RETRYABLE") {
             (StatusCode::CONFLICT, "JOB_NOT_RETRYABLE", details)
         } else if details.contains("JOB_RETRY_LIMIT") {
@@ -271,6 +346,7 @@ pub async fn serve_api(options: ApiServerOptions) -> Result<()> {
     let workspace = Workspace::open(&options.workspace)?;
     let store = ProjectStore::open(&options.database)?;
     let cancellation = JobCancellationRegistry::default();
+    let ffprobe = options.ffprobe.clone();
     let runner = RenderJobRunner::new(
         store.clone(),
         workspace.root().to_path_buf(),
@@ -283,6 +359,7 @@ pub async fn serve_api(options: ApiServerOptions) -> Result<()> {
     let app = build_router(
         store,
         workspace.root().to_path_buf(),
+        ffprobe,
         options.bearer_token,
         cancellation,
     );
@@ -315,13 +392,16 @@ fn validate_bearer_token(token: &str) -> Result<()> {
 fn build_router(
     store: ProjectStore,
     workspace: PathBuf,
+    ffprobe: PathBuf,
     bearer_token: String,
     cancellation: JobCancellationRegistry,
 ) -> Router {
     let state = ApiState {
         store,
         workspace,
+        ffprobe,
         cancellation,
+        uploads: UploadControl::default(),
     };
     Router::new()
         .route("/v1/projects", post(create_project))
@@ -343,6 +423,19 @@ fn build_router(
         .route("/v1/jobs/{job_id}", get(get_render_job))
         .route("/v1/jobs/{job_id}/cancel", post(cancel_render_job))
         .route("/v1/jobs/{job_id}/retry", post(retry_render_job))
+        .route("/v1/assets/uploads", post(create_asset_upload))
+        .route(
+            "/v1/assets/uploads/{upload_id}/content",
+            put(put_asset_upload),
+        )
+        .route(
+            "/v1/assets/uploads/{upload_id}/complete",
+            post(complete_asset_upload),
+        )
+        .route(
+            "/v1/assets/uploads/{upload_id}",
+            delete(cancel_asset_upload),
+        )
         .route("/v1/assets/{asset_id}", get(get_asset_metadata))
         .route("/v1/assets/{asset_id}/content", get(get_asset_content))
         .layer(DefaultBodyLimit::max(MAX_API_BODY_BYTES))
@@ -568,6 +661,331 @@ async fn retry_render_job(
     Ok((status, Json(submission)).into_response())
 }
 
+async fn create_asset_upload(
+    State(state): State<ApiState>,
+    payload: std::result::Result<Json<CreateUploadRequest>, JsonRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let Json(request) = payload.map_err(ApiError::from_json_rejection)?;
+    if request.expected_bytes == 0 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VALIDATION_FAILED",
+            "expectedBytes must be greater than zero",
+        ));
+    }
+    if request.expected_bytes > MAX_IMPORT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PAYLOAD_TOO_LARGE",
+            "uploads are limited to 2 GiB",
+        ));
+    }
+
+    let _creation_guard = state.uploads.creation_lock.lock().await;
+    let workspace_path = state.workspace.clone();
+    let expired_sessions = tokio::task::spawn_blocking(move || {
+        Workspace::open(&workspace_path)?.expired_upload_session_ids(SystemTime::now())
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload cleanup scan did not complete"))??;
+    for expired_id in expired_sessions {
+        let session_lock = state.uploads.session_lock(&expired_id);
+        let _session_guard = session_lock.lock().await;
+        let workspace_path = state.workspace.clone();
+        tokio::task::spawn_blocking(move || {
+            Workspace::open(&workspace_path)?
+                .remove_upload_session_if_expired(&expired_id, SystemTime::now())
+        })
+        .await
+        .map_err(|_| ApiError::internal("The expired upload cleanup did not complete"))??;
+    }
+
+    let workspace_path = state.workspace.clone();
+    let (workspace, session_count, reserved_bytes) = tokio::task::spawn_blocking(move || {
+        let workspace = Workspace::open(&workspace_path)?;
+        let (session_count, reserved_bytes) = workspace.upload_session_usage()?;
+        Ok::<_, anyhow::Error>((workspace, session_count, reserved_bytes))
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload workspace check did not complete"))??;
+    let reservation_total = reserved_bytes.checked_add(request.expected_bytes);
+    if session_count >= MAX_CONCURRENT_UPLOADS
+        || reservation_total.is_none_or(|total| total > MAX_IMPORT_BYTES)
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "QUOTA_EXCEEDED",
+            "The upload staging quota is full; complete or cancel an existing upload",
+        ));
+    }
+
+    let upload_id = Uuid::new_v4().to_string();
+    let created_id = upload_id.clone();
+    tokio::task::spawn_blocking(move || {
+        workspace.create_upload_session(&created_id, request.expected_bytes)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload session worker did not complete"))??;
+
+    let body = UploadSessionResponse {
+        upload_id: upload_id.clone(),
+        expected_bytes: request.expected_bytes,
+        upload_url: format!("/v1/assets/uploads/{upload_id}/content"),
+        complete_url: format!("/v1/assets/uploads/{upload_id}/complete"),
+    };
+    Ok((StatusCode::CREATED, Json(body)).into_response())
+}
+
+async fn put_asset_upload(
+    State(state): State<ApiState>,
+    Path(upload_id): Path<String>,
+    body: Body,
+) -> std::result::Result<Json<UploadReceivedResponse>, ApiError> {
+    validate_asset_id(&upload_id).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_FAILED",
+            "uploadId must be a canonical UUID",
+        )
+    })?;
+    let session_lock = state.uploads.session_lock(&upload_id);
+    let _session_guard = session_lock.lock().await;
+    let workspace_path = state.workspace.clone();
+    let session_id = upload_id.clone();
+    let session = tokio::task::spawn_blocking(move || {
+        Workspace::open(&workspace_path)?.load_upload_session(&session_id)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload session lookup did not complete"))??;
+    if session.is_expired(SystemTime::now()) {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "UPLOAD_EXPIRED",
+            "The upload session expired after 24 hours of inactivity",
+        ));
+    }
+    let workspace_path = state.workspace.clone();
+    let touch_id = upload_id.clone();
+    tokio::task::spawn_blocking(move || {
+        Workspace::open(&workspace_path)?.touch_upload_session(&touch_id)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload activity update did not complete"))??;
+
+    if tokio::fs::try_exists(&session.source)
+        .await
+        .map_err(|_| ApiError::internal("The upload destination could not be inspected"))?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "UPLOAD_ALREADY_RECEIVED",
+            "Content has already been received for this upload session",
+        ));
+    }
+    if tokio::fs::try_exists(&session.partial)
+        .await
+        .map_err(|_| ApiError::internal("The partial upload could not be inspected"))?
+    {
+        tokio::fs::remove_file(&session.partial)
+            .await
+            .map_err(|_| ApiError::internal("The previous partial upload could not be removed"))?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&session.partial)
+        .await
+        .map_err(|_| ApiError::internal("The upload staging file could not be created"))?;
+    let mut stream = body.into_data_stream();
+    let receive_result = async {
+        let mut received = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "UPLOAD_STREAM_FAILED",
+                    "The request body stream ended unexpectedly",
+                )
+            })?;
+            let chunk_bytes = u64::try_from(chunk.len()).map_err(|_| {
+                ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "PAYLOAD_TOO_LARGE",
+                    "The upload body is too large",
+                )
+            })?;
+            received = received.checked_add(chunk_bytes).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "PAYLOAD_TOO_LARGE",
+                    "The upload body is too large",
+                )
+            })?;
+            if received > session.expected_bytes || received > MAX_IMPORT_BYTES {
+                return Err(ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "PAYLOAD_TOO_LARGE",
+                    "The upload body exceeds its reserved size",
+                ));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(|_| ApiError::internal("The upload body could not be staged"))?;
+        }
+        if received != session.expected_bytes {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "UPLOAD_SIZE_MISMATCH",
+                format!(
+                    "Expected {} bytes but received {received}",
+                    session.expected_bytes
+                ),
+            ));
+        }
+        file.sync_all()
+            .await
+            .map_err(|_| ApiError::internal("The staged upload could not be flushed"))?;
+        Ok::<_, ApiError>(received)
+    }
+    .await;
+
+    let received = match receive_result {
+        Ok(received) => received,
+        Err(error) => {
+            drop(file);
+            let _ = tokio::fs::remove_file(&session.partial).await;
+            return Err(error);
+        }
+    };
+    drop(file);
+    if tokio::fs::rename(&session.partial, &session.source)
+        .await
+        .is_err()
+    {
+        let _ = tokio::fs::remove_file(&session.partial).await;
+        return Err(ApiError::internal(
+            "The completed upload could not be staged",
+        ));
+    }
+    let workspace_path = state.workspace.clone();
+    let touch_id = upload_id.clone();
+    tokio::task::spawn_blocking(move || {
+        Workspace::open(&workspace_path)?.touch_upload_session(&touch_id)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload activity update did not complete"))??;
+    Ok(Json(UploadReceivedResponse {
+        upload_id,
+        bytes: received,
+    }))
+}
+
+async fn complete_asset_upload(
+    State(state): State<ApiState>,
+    Path(upload_id): Path<String>,
+) -> std::result::Result<Response, ApiError> {
+    validate_asset_id(&upload_id).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_FAILED",
+            "uploadId must be a canonical UUID",
+        )
+    })?;
+    let session_lock = state.uploads.session_lock(&upload_id);
+    let _session_guard = session_lock.lock().await;
+
+    let workspace_path = state.workspace.clone();
+    let existing_id = upload_id.clone();
+    let existing_asset = tokio::task::spawn_blocking(move || {
+        let workspace = Workspace::open(&workspace_path)?;
+        match workspace.load_asset(&existing_id) {
+            Ok((_, manifest)) => Ok(Some(ImportedAsset {
+                asset_id: manifest.asset_id.clone(),
+                uri: format!("asset://{}", manifest.asset_id),
+                sha256: manifest.sha256,
+                kind: manifest.kind,
+                bytes: manifest.bytes,
+                probe: manifest.probe,
+            })),
+            Err(error) if format!("{error:#}").contains("ASSET_NOT_FOUND") => Ok(None),
+            Err(error) => Err(error),
+        }
+    })
+    .await
+    .map_err(|_| ApiError::internal("The asset lookup worker did not complete"))??;
+    if let Some(asset) = existing_asset {
+        return Ok((
+            StatusCode::OK,
+            Json(CompleteUploadResponse {
+                asset,
+                replayed: true,
+            }),
+        )
+            .into_response());
+    }
+
+    let workspace_path = state.workspace.clone();
+    let session_id = upload_id.clone();
+    let session = tokio::task::spawn_blocking(move || {
+        Workspace::open(&workspace_path)?.load_upload_session(&session_id)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload session lookup did not complete"))??;
+    if session.is_expired(SystemTime::now()) {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "UPLOAD_EXPIRED",
+            "The upload session expired after 24 hours of inactivity",
+        ));
+    }
+    let workspace_path = state.workspace.clone();
+    let touch_id = upload_id.clone();
+    tokio::task::spawn_blocking(move || {
+        Workspace::open(&workspace_path)?.touch_upload_session(&touch_id)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload activity update did not complete"))??;
+
+    let workspace = state.workspace.clone();
+    let ffprobe = state.ffprobe.clone();
+    let complete_id = upload_id.clone();
+    let asset = tokio::task::spawn_blocking(move || {
+        complete_uploaded_asset(&workspace, &complete_id, &ffprobe)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The uploaded media probe did not complete"))??;
+    Ok((
+        StatusCode::CREATED,
+        Json(CompleteUploadResponse {
+            asset,
+            replayed: false,
+        }),
+    )
+        .into_response())
+}
+
+async fn cancel_asset_upload(
+    State(state): State<ApiState>,
+    Path(upload_id): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    validate_asset_id(&upload_id).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_FAILED",
+            "uploadId must be a canonical UUID",
+        )
+    })?;
+    let session_lock = state.uploads.session_lock(&upload_id);
+    let _session_guard = session_lock.lock().await;
+    let workspace_path = state.workspace.clone();
+    tokio::task::spawn_blocking(move || {
+        Workspace::open(&workspace_path)?.remove_upload_session(&upload_id)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The upload cancellation did not complete"))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn resolve_api_asset(
     state: &ApiState,
     asset_id: &str,
@@ -762,7 +1180,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, path::PathBuf};
+    use std::{fs, path::Path, path::PathBuf, process::Command};
 
     use axum::{
         body::{Body, to_bytes},
@@ -783,6 +1201,459 @@ mod tests {
     const PROJECT_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0a";
     const ASSET_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0b";
     const TEST_TOKEN: &str = "local-test-token-0123456789abcdef012345";
+
+    #[tokio::test]
+    async fn uploads_survive_restart_and_are_bounded_validated_idempotent_and_downloadable() {
+        let Some(ffmpeg) = configured_tool("STUDIO_TEST_FFMPEG", "ffmpeg") else {
+            eprintln!("skipping media upload integration test: ffmpeg not found");
+            return;
+        };
+        let Some(ffprobe) = configured_tool("STUDIO_TEST_FFPROBE", "ffprobe") else {
+            eprintln!("skipping media upload integration test: ffprobe not found");
+            return;
+        };
+        let root = tempdir().unwrap();
+        let workspace_path = root.path().join("workspace");
+        let source_path = root.path().join("uploaded.mp4");
+        make_upload_fixture(&ffmpeg, &source_path);
+        let source_bytes = fs::read(&source_path).unwrap();
+        assert!(source_bytes.len() > MAX_API_BODY_BYTES);
+        let app = build_router(
+            ProjectStore::open(root.path().join("projects.sqlite")).unwrap(),
+            workspace_path.clone(),
+            ffprobe.clone(),
+            TEST_TOKEN.to_owned(),
+            JobCancellationRegistry::default(),
+        );
+
+        let unauthorized = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            None,
+            Some(json!({"expectedBytes": source_bytes.len()}).to_string()),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let too_large = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": MAX_IMPORT_BYTES + 1}).to_string()),
+        )
+        .await;
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let reservation = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": MAX_IMPORT_BYTES}).to_string()),
+        )
+        .await;
+        assert_eq!(reservation.status(), StatusCode::CREATED);
+        let reservation: Value = response_json(reservation).await;
+        let reservation_id = reservation["uploadId"].as_str().unwrap();
+        let over_quota = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": 1}).to_string()),
+        )
+        .await;
+        assert_eq!(over_quota.status(), StatusCode::TOO_MANY_REQUESTS);
+        let cancelled = request(
+            &app,
+            Method::DELETE,
+            &format!("/v1/assets/uploads/{reservation_id}"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+
+        let bounded = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": 4}).to_string()),
+        )
+        .await;
+        let bounded: Value = response_json(bounded).await;
+        let excessive = raw_request(
+            &app,
+            Method::PUT,
+            bounded["uploadUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            b"12345",
+        )
+        .await;
+        assert_eq!(excessive.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let retried = raw_request(
+            &app,
+            Method::PUT,
+            bounded["uploadUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            b"1234",
+        )
+        .await;
+        assert_eq!(retried.status(), StatusCode::OK);
+        let cancelled = request(
+            &app,
+            Method::DELETE,
+            &format!(
+                "/v1/assets/uploads/{}",
+                bounded["uploadId"].as_str().unwrap()
+            ),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+
+        let created = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": source_bytes.len()}).to_string()),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = response_json(created).await;
+        let upload_id = created["uploadId"].as_str().unwrap().to_owned();
+        assert_eq!(created["expectedBytes"], source_bytes.len());
+        let resumed_app = build_router(
+            ProjectStore::open(root.path().join("projects.sqlite")).unwrap(),
+            workspace_path,
+            ffprobe,
+            TEST_TOKEN.to_owned(),
+            JobCancellationRegistry::default(),
+        );
+
+        let incomplete = raw_request(
+            &resumed_app,
+            Method::PUT,
+            created["uploadUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            &source_bytes[..source_bytes.len() - 1],
+        )
+        .await;
+        assert_eq!(incomplete.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let uploaded = raw_request(
+            &resumed_app,
+            Method::PUT,
+            created["uploadUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            &source_bytes,
+        )
+        .await;
+        assert_eq!(uploaded.status(), StatusCode::OK);
+        assert_eq!(response_json(uploaded).await["bytes"], source_bytes.len());
+
+        let complete_url = created["completeUrl"].as_str().unwrap();
+        let completed = request(
+            &resumed_app,
+            Method::POST,
+            complete_url,
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(completed.status(), StatusCode::CREATED);
+        let completed: Value = response_json(completed).await;
+        assert_eq!(completed["replayed"], false);
+        assert_eq!(completed["asset"]["assetId"], upload_id);
+        assert_eq!(completed["asset"]["kind"], "video");
+        let expected_hash = hex::encode(Sha256::digest(&source_bytes));
+        assert_eq!(completed["asset"]["sha256"], expected_hash);
+
+        let replay = request(
+            &resumed_app,
+            Method::POST,
+            complete_url,
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value = response_json(replay).await;
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["asset"]["assetId"], upload_id);
+
+        let download = request(
+            &app,
+            Method::GET,
+            &format!("/v1/assets/{upload_id}/content"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(download.status(), StatusCode::OK);
+        let downloaded = to_bytes(download.into_body(), source_bytes.len() + 1)
+            .await
+            .unwrap();
+        assert_eq!(&downloaded[..], &source_bytes);
+        assert_eq!(hex::encode(Sha256::digest(&downloaded)), expected_hash);
+
+        let invalid_bytes = b"not a media file";
+        let invalid = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": invalid_bytes.len()}).to_string()),
+        )
+        .await;
+        let invalid: Value = response_json(invalid).await;
+        let invalid_id = invalid["uploadId"].as_str().unwrap();
+        let invalid_content = raw_request(
+            &app,
+            Method::PUT,
+            invalid["uploadUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            invalid_bytes,
+        )
+        .await;
+        assert_eq!(invalid_content.status(), StatusCode::OK);
+        let invalid_complete = request(
+            &app,
+            Method::POST,
+            invalid["completeUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(invalid_complete.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let cancelled = request(
+            &app,
+            Method::DELETE,
+            &format!("/v1/assets/uploads/{invalid_id}"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn expired_uploads_are_rejected_and_cleaned_before_new_reservations() {
+        use std::time::Duration;
+
+        let root = tempdir().unwrap();
+        let workspace_path = root.path().join("workspace");
+        let app = build_router(
+            ProjectStore::open(root.path().join("projects.sqlite")).unwrap(),
+            workspace_path.clone(),
+            "ffprobe".into(),
+            TEST_TOKEN.to_owned(),
+            JobCancellationRegistry::default(),
+        );
+        let created = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": 8}).to_string()),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = response_json(created).await;
+        let upload_id = created["uploadId"].as_str().unwrap();
+        let session_dir = workspace_path.join("tmp").join("uploads").join(upload_id);
+        let old_activity = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(session_dir.join("upload.json"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_activity))
+            .unwrap();
+
+        let expired_put = raw_request(
+            &app,
+            Method::PUT,
+            created["uploadUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            b"12345678",
+        )
+        .await;
+        assert_eq!(expired_put.status(), StatusCode::GONE);
+        assert_eq!(
+            response_json(expired_put).await["error"]["code"],
+            "UPLOAD_EXPIRED"
+        );
+        let expired_complete = request(
+            &app,
+            Method::POST,
+            created["completeUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(expired_complete.status(), StatusCode::GONE);
+
+        let next = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": 1}).to_string()),
+        )
+        .await;
+        assert_eq!(next.status(), StatusCode::CREATED);
+        assert!(!session_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn uploaded_asset_can_be_used_to_render_and_download_a_verified_output() {
+        let Some(ffmpeg) = configured_tool("STUDIO_TEST_FFMPEG", "ffmpeg") else {
+            eprintln!("skipping API render flow test: ffmpeg not found");
+            return;
+        };
+        let Some(ffprobe) = configured_tool("STUDIO_TEST_FFPROBE", "ffprobe") else {
+            eprintln!("skipping API render flow test: ffprobe not found");
+            return;
+        };
+        let root = tempdir().unwrap();
+        let workspace_path = root.path().join("workspace");
+        let database = root.path().join("projects.sqlite");
+        let source_path = root.path().join("render-source.mp4");
+        make_simple_render_fixture(&ffmpeg, &source_path);
+        let source_bytes = fs::read(&source_path).unwrap();
+        let store = ProjectStore::open(&database).unwrap();
+        let cancellation = JobCancellationRegistry::default();
+        let app = build_router(
+            store.clone(),
+            workspace_path.clone(),
+            ffprobe.clone(),
+            TEST_TOKEN.to_owned(),
+            cancellation.clone(),
+        );
+
+        let created_upload = request(
+            &app,
+            Method::POST,
+            "/v1/assets/uploads",
+            Some(TEST_TOKEN),
+            Some(json!({"expectedBytes": source_bytes.len()}).to_string()),
+        )
+        .await;
+        assert_eq!(created_upload.status(), StatusCode::CREATED);
+        let created_upload: Value = response_json(created_upload).await;
+        let upload = raw_request(
+            &app,
+            Method::PUT,
+            created_upload["uploadUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            &source_bytes,
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::OK);
+        let completed = request(
+            &app,
+            Method::POST,
+            created_upload["completeUrl"].as_str().unwrap(),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(completed.status(), StatusCode::CREATED);
+        let completed: Value = response_json(completed).await;
+        let uploaded_asset_id = completed["asset"]["assetId"].as_str().unwrap();
+        let uploaded_asset_sha256 = completed["asset"]["sha256"].as_str().unwrap();
+
+        let project = request(
+            &app,
+            Method::POST,
+            "/v1/projects",
+            Some(TEST_TOKEN),
+            Some(timeline_for_uploaded_asset(uploaded_asset_id, uploaded_asset_sha256).to_string()),
+        )
+        .await;
+        assert_eq!(project.status(), StatusCode::CREATED);
+        let project: Value = response_json(project).await;
+        assert_eq!(project["revision"], 1);
+        let project_id = project["projectId"].as_str().unwrap();
+
+        let queued = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/renders"),
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "revision": 1,
+                    "presetId": "export",
+                    "idempotencyKey": "uploaded-asset-render"
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued: Value = response_json(queued).await;
+        let job_id = queued["job"]["jobId"].as_str().unwrap();
+
+        let runner = RenderJobRunner::new(
+            store,
+            workspace_path,
+            ffmpeg,
+            ffprobe,
+            None,
+            120,
+            cancellation,
+        );
+        assert!(runner.run_once().await.unwrap());
+
+        let job = request(
+            &app,
+            Method::GET,
+            &format!("/v1/jobs/{job_id}"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(job.status(), StatusCode::OK);
+        let job: Value = response_json(job).await;
+        assert_eq!(job["status"], "succeeded");
+        assert_eq!(job["revision"], 1);
+        let output_asset_id = job["outputAssetId"].as_str().unwrap();
+
+        let metadata = request(
+            &app,
+            Method::GET,
+            &format!("/v1/assets/{output_asset_id}"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(metadata.status(), StatusCode::OK);
+        let metadata: Value = response_json(metadata).await;
+        assert_eq!(metadata["mimeType"], "video/mp4");
+        assert_eq!(metadata["presetId"], "export");
+        let expected_hash = job["result"]["outputSha256"].as_str().unwrap();
+        assert_eq!(metadata["sha256"], expected_hash);
+
+        let output = request(
+            &app,
+            Method::GET,
+            &format!("/v1/assets/{output_asset_id}/content"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(output.status(), StatusCode::OK);
+        let output = to_bytes(output.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!output.is_empty());
+        assert_eq!(hex::encode(Sha256::digest(&output)), expected_hash);
+    }
 
     #[tokio::test]
     async fn server_rejects_non_loopback_bind_and_short_tokens() {
@@ -825,6 +1696,7 @@ mod tests {
         let app = build_router(
             ProjectStore::open(root.path().join("projects.sqlite")).unwrap(),
             workspace_path,
+            "ffprobe".into(),
             TEST_TOKEN.to_owned(),
             JobCancellationRegistry::default(),
         );
@@ -1194,6 +2066,7 @@ mod tests {
         let app = build_router(
             store.clone(),
             workspace_path.clone(),
+            "ffprobe".into(),
             TEST_TOKEN.to_owned(),
             JobCancellationRegistry::default(),
         );
@@ -1453,6 +2326,41 @@ mod tests {
         assert!(workspace.load_asset(ASSET_ID).is_ok());
     }
 
+    fn timeline_for_uploaded_asset(asset_id: &str, sha256: &str) -> Value {
+        json!({
+            "schemaVersion": "1.0.0",
+            "projectId": PROJECT_ID,
+            "revision": 0,
+            "canvas": {
+                "width": 320,
+                "height": 240,
+                "fps": {"num": 24, "den": 1},
+                "background": "#101820"
+            },
+            "assets": {
+                (asset_id): {
+                    "kind": "video",
+                    "uri": format!("asset://{asset_id}"),
+                    "sha256": sha256
+                }
+            },
+            "tracks": [{
+                "id": "video-main",
+                "kind": "video",
+                "order": 0,
+                "clips": [{
+                    "id": "uploaded-clip",
+                    "kind": "video",
+                    "assetId": asset_id,
+                    "startFrame": 0,
+                    "durationFrames": 24,
+                    "sourceIn": {"ticks": 0, "timebase_num": 1, "timebase_den": 24},
+                    "sourceOut": {"ticks": 24, "timebase_num": 1, "timebase_den": 24}
+                }]
+            }]
+        })
+    }
+
     fn timeline_document() -> Value {
         json!({
             "schemaVersion": "1.0.0",
@@ -1491,6 +2399,80 @@ mod tests {
         })
     }
 
+    fn configured_tool(variable: &str, fallback: &str) -> Option<PathBuf> {
+        let path = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(fallback));
+        Command::new(&path)
+            .arg("-version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| path)
+    }
+
+    fn make_upload_fixture(ffmpeg: &Path, output_path: &Path) {
+        let output = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x240:r=24:d=1",
+                "-vf",
+                "noise=alls=100:allf=t+u",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                "-y",
+            ])
+            .arg(output_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "could not create media upload fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn make_simple_render_fixture(ffmpeg: &Path, output_path: &Path) {
+        let output = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x240:r=24:d=1",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(output_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "could not create render media fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     async fn request(
         app: &Router,
         method: Method,
@@ -1507,6 +2489,26 @@ mod tests {
         }
         app.clone()
             .oneshot(builder.body(Body::from(body.unwrap_or_default())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn raw_request(
+        app: &Router,
+        method: Method,
+        uri: &str,
+        token: Option<&str>,
+        body: &[u8],
+    ) -> Response {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/octet-stream");
+        if let Some(token) = token {
+            builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        app.clone()
+            .oneshot(builder.body(Body::from(body.to_vec())).unwrap())
             .await
             .unwrap()
     }

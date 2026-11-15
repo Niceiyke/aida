@@ -156,6 +156,43 @@ pub fn import_asset(options: ImportOptions) -> Result<ImportedAsset> {
     })
 }
 
+pub(crate) fn complete_uploaded_asset(
+    workspace_path: &Path,
+    upload_id: &str,
+    ffprobe: &Path,
+) -> Result<ImportedAsset> {
+    let workspace = Workspace::open(workspace_path)?;
+    let session = workspace.load_upload_session(upload_id)?;
+    let (sha256, bytes) = hash_file(&session.source)?;
+    if bytes != session.expected_bytes {
+        bail!("uploaded media size does not match the upload reservation");
+    }
+    let probe = probe_media(ffprobe, &session.source)?;
+    validate_probe(&probe)?;
+    let kind = if probe.has_video {
+        AssetKind::Video
+    } else {
+        AssetKind::Audio
+    };
+    let manifest = AssetManifest {
+        schema_version: 1,
+        asset_id: upload_id.to_owned(),
+        sha256: sha256.clone(),
+        bytes,
+        kind,
+        probe: probe.clone(),
+    };
+    workspace.publish_upload_session(upload_id, &manifest)?;
+    Ok(ImportedAsset {
+        asset_id: upload_id.to_owned(),
+        uri: format!("asset://{upload_id}"),
+        sha256,
+        kind,
+        bytes,
+        probe,
+    })
+}
+
 pub fn probe_media(ffprobe: &Path, file: &Path) -> Result<MediaProbe> {
     probe_media_cancellable(ffprobe, file, None)
 }
@@ -327,6 +364,38 @@ fn copy_and_hash(source: &Path, destination: &Path) -> Result<(String, u64)> {
             .context("could not stage input media")?;
     }
     output.sync_all().context("could not flush staged asset")?;
+    Ok((hex::encode(hasher.finalize()), bytes))
+}
+
+fn hash_file(path: &Path) -> Result<(String, u64)> {
+    let mut input = File::open(path).context("could not open uploaded media")?;
+    let metadata = input
+        .metadata()
+        .context("could not inspect uploaded media")?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_IMPORT_BYTES {
+        bail!("uploaded media must be between 1 byte and 2 GiB");
+    }
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .context("could not read uploaded media")?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(u64::try_from(read).context("uploaded media size is out of range")?)
+            .context("uploaded media size overflowed")?;
+        if bytes > MAX_IMPORT_BYTES {
+            bail!("uploaded media exceeds the 2 GiB import limit");
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if bytes != metadata.len() {
+        bail!("uploaded media changed while it was being hashed");
+    }
     Ok((hex::encode(hasher.finalize()), bytes))
 }
 

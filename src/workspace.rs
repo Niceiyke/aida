@@ -1,16 +1,44 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::media::{AssetKind, MediaProbe};
+use crate::media::{AssetKind, MAX_IMPORT_BYTES, MediaProbe};
 
 pub const SOURCE_FILENAME: &str = "source.media";
 const ASSET_MANIFEST_FILENAME: &str = "asset.json";
+const UPLOAD_SESSION_FILENAME: &str = "upload.json";
+const UPLOAD_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UploadSessionManifest {
+    schema_version: u32,
+    upload_id: String,
+    expected_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UploadSession {
+    pub directory: PathBuf,
+    pub source: PathBuf,
+    pub partial: PathBuf,
+    pub expected_bytes: u64,
+    last_activity: SystemTime,
+}
+
+impl UploadSession {
+    pub(crate) fn is_expired(&self, now: SystemTime) -> bool {
+        now.duration_since(self.last_activity)
+            .is_ok_and(|age| age >= UPLOAD_SESSION_TTL)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -28,6 +56,7 @@ pub struct Workspace {
     root: PathBuf,
     assets: PathBuf,
     temporary: PathBuf,
+    uploads: PathBuf,
     renders: PathBuf,
 }
 
@@ -39,6 +68,7 @@ impl Workspace {
             .with_context(|| format!("could not resolve workspace {}", path.display()))?;
         let assets = root.join("assets");
         let temporary = root.join("tmp");
+        let uploads = temporary.join("uploads");
         let renders = root.join("renders");
         ensure_safe_directory(&assets)?;
         ensure_safe_directory(&temporary)?;
@@ -47,6 +77,7 @@ impl Workspace {
             root,
             assets,
             temporary,
+            uploads,
             renders,
         })
     }
@@ -186,6 +217,234 @@ impl Workspace {
         Ok(staging)
     }
 
+    pub(crate) fn create_upload_session(&self, id: &str, expected_bytes: u64) -> Result<()> {
+        validate_asset_id(id)?;
+        if expected_bytes == 0 || expected_bytes > MAX_IMPORT_BYTES {
+            bail!("upload size must be between 1 byte and 2 GiB");
+        }
+        ensure_safe_directory(&self.uploads)?;
+        let directory = self.uploads.join(id);
+        fs::create_dir(&directory)
+            .with_context(|| format!("could not create upload session {id}"))?;
+        let session = UploadSessionManifest {
+            schema_version: 1,
+            upload_id: id.to_owned(),
+            expected_bytes,
+        };
+        let result = (|| -> Result<()> {
+            let path = directory.join(UPLOAD_SESSION_FILENAME);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .context("could not create upload session metadata")?;
+            file.write_all(&serde_json::to_vec(&session)?)
+                .context("could not write upload session metadata")?;
+            file.sync_all()
+                .context("could not flush upload session metadata")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&directory);
+        }
+        result
+    }
+
+    pub(crate) fn load_upload_session(&self, id: &str) -> Result<UploadSession> {
+        validate_asset_id(id)?;
+        let uploads_metadata = fs::symlink_metadata(&self.uploads).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow!("UPLOAD_NOT_FOUND: upload {id} does not exist")
+            } else {
+                anyhow!(error).context("could not inspect upload staging directory")
+            }
+        })?;
+        if uploads_metadata.file_type().is_symlink() || !uploads_metadata.is_dir() {
+            bail!("upload staging path is not a safe directory");
+        }
+        let directory = self.uploads.join(id);
+        let directory_metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow!("UPLOAD_NOT_FOUND: upload {id} does not exist")
+            } else {
+                anyhow!(error).context("could not inspect upload session directory")
+            }
+        })?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            bail!("upload session is not a safe directory");
+        }
+        let directory =
+            fs::canonicalize(&directory).context("could not resolve upload session directory")?;
+        if !directory.starts_with(&self.uploads) {
+            bail!("upload session is outside the workspace staging directory");
+        }
+        let metadata_path = directory.join(UPLOAD_SESSION_FILENAME);
+        ensure_not_symlink(&metadata_path)?;
+        if !fs::metadata(&metadata_path)?.is_file() {
+            bail!("upload session metadata is not a regular file");
+        }
+        let manifest: UploadSessionManifest = serde_json::from_slice(
+            &fs::read(&metadata_path).context("could not read upload session metadata")?,
+        )
+        .context("upload session metadata is invalid")?;
+        if manifest.schema_version != 1
+            || manifest.upload_id != id
+            || manifest.expected_bytes == 0
+            || manifest.expected_bytes > MAX_IMPORT_BYTES
+        {
+            bail!("upload session metadata is unsupported or mismatched");
+        }
+        let source = directory.join(SOURCE_FILENAME);
+        let partial = directory.join("source.media.part");
+        ensure_not_symlink_if_present(&source)?;
+        ensure_not_symlink_if_present(&partial)?;
+        let last_activity = fs::metadata(&metadata_path)
+            .context("could not inspect upload session activity")?
+            .modified()
+            .context("upload session activity time is unavailable")?;
+        Ok(UploadSession {
+            directory,
+            source,
+            partial,
+            expected_bytes: manifest.expected_bytes,
+            last_activity,
+        })
+    }
+
+    pub(crate) fn touch_upload_session(&self, id: &str) -> Result<()> {
+        let session = self.load_upload_session(id)?;
+        let metadata_path = session.directory.join(UPLOAD_SESSION_FILENAME);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&metadata_path)
+            .context("could not open upload session activity marker")?;
+        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
+            .context("could not update upload session activity time")
+    }
+
+    pub(crate) fn expired_upload_session_ids(&self, now: SystemTime) -> Result<Vec<String>> {
+        let uploads_metadata = match fs::symlink_metadata(&self.uploads) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("could not inspect upload staging directory"),
+        };
+        if uploads_metadata.file_type().is_symlink() || !uploads_metadata.is_dir() {
+            bail!("upload staging path is not a safe directory");
+        }
+        let mut expired = Vec::new();
+        for entry in fs::read_dir(&self.uploads).context("could not list upload sessions")? {
+            let entry = entry.context("could not read upload session entry")?;
+            let file_type = entry
+                .file_type()
+                .context("could not inspect upload entry")?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                bail!("upload staging contains an unsafe entry");
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if self.load_upload_session(&id)?.is_expired(now) {
+                expired.push(id);
+            }
+        }
+        Ok(expired)
+    }
+
+    pub(crate) fn remove_upload_session_if_expired(
+        &self,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<bool> {
+        let session = match self.load_upload_session(id) {
+            Ok(session) => session,
+            Err(error) if format!("{error:#}").contains("UPLOAD_NOT_FOUND") => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !session.is_expired(now) {
+            return Ok(false);
+        }
+        self.remove_upload_session(id)?;
+        Ok(true)
+    }
+
+    pub(crate) fn upload_session_usage(&self) -> Result<(usize, u64)> {
+        let uploads_metadata = match fs::symlink_metadata(&self.uploads) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(error) => return Err(error).context("could not inspect upload staging directory"),
+        };
+        if uploads_metadata.file_type().is_symlink() || !uploads_metadata.is_dir() {
+            bail!("upload staging path is not a safe directory");
+        }
+        let mut sessions = 0_usize;
+        let mut reserved_bytes = 0_u64;
+        for entry in fs::read_dir(&self.uploads).context("could not list upload sessions")? {
+            let entry = entry.context("could not read upload session entry")?;
+            let file_type = entry
+                .file_type()
+                .context("could not inspect upload entry")?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                bail!("upload staging contains an unsafe entry");
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let session = self.load_upload_session(&id)?;
+            sessions = sessions
+                .checked_add(1)
+                .context("upload session count overflowed")?;
+            reserved_bytes = reserved_bytes
+                .checked_add(session.expected_bytes)
+                .context("upload reservation size overflowed")?;
+        }
+        Ok((sessions, reserved_bytes))
+    }
+
+    pub(crate) fn publish_upload_session(&self, id: &str, manifest: &AssetManifest) -> Result<()> {
+        if manifest.asset_id != id || manifest.schema_version != 1 {
+            bail!("upload manifest does not match its session");
+        }
+        let session = self.load_upload_session(id)?;
+        if session.expected_bytes != manifest.bytes {
+            bail!("upload manifest size does not match its reservation");
+        }
+        let source_metadata =
+            fs::symlink_metadata(&session.source).context("uploaded media file is missing")?;
+        if source_metadata.file_type().is_symlink()
+            || !source_metadata.is_file()
+            || source_metadata.len() != manifest.bytes
+        {
+            bail!("uploaded media file does not match its declared size");
+        }
+
+        let destination = self.assets.join(id);
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => bail!("asset {id} already exists"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("could not inspect asset destination"),
+        }
+        let manifest_path = session.directory.join(ASSET_MANIFEST_FILENAME);
+        ensure_not_symlink_if_present(&manifest_path)?;
+        fs::write(&manifest_path, serde_json::to_vec_pretty(manifest)?)
+            .context("could not write uploaded asset manifest")?;
+        fs::rename(&session.directory, &destination)
+            .context("could not atomically publish uploaded asset")?;
+        // The directory rename is the publication point; this small metadata file is not
+        // required for asset reads and can be cleaned up after an interrupted publication.
+        let _ = fs::remove_file(destination.join(UPLOAD_SESSION_FILENAME));
+        Ok(())
+    }
+
+    pub(crate) fn remove_upload_session(&self, id: &str) -> Result<()> {
+        validate_asset_id(id)?;
+        match fs::symlink_metadata(&self.uploads) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("could not inspect upload staging directory"),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                bail!("upload staging path is not a safe directory");
+            }
+            Ok(_) => {}
+        }
+        let directory = self.uploads.join(id);
+        remove_owned_directory(&self.uploads, &directory).context("could not remove upload session")
+    }
+
     pub fn publish_staging_asset(&self, id: &str, staging: &Path) -> Result<()> {
         validate_asset_id(id)?;
         let expected_staging = self.assets.join(format!(".import-{id}"));
@@ -298,11 +557,17 @@ fn ensure_not_symlink_if_present(path: &Path) -> Result<()> {
 }
 
 fn remove_owned_directory(parent: &Path, path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
     ensure_not_symlink(parent)?;
-    ensure_not_symlink(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to remove symlink {}", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not inspect {}", path.display()));
+        }
+    }
     let parent = fs::canonicalize(parent).context("could not resolve render output parent")?;
     let path_canonical = fs::canonicalize(path).context("could not resolve render attempt")?;
     if !path_canonical.starts_with(parent) || !path_canonical.is_dir() {
@@ -316,7 +581,6 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::media::MediaProbe;
-    #[cfg(unix)]
     use tempfile::tempdir;
 
     #[cfg(unix)]
@@ -326,6 +590,46 @@ mod tests {
     fn asset_ids_cannot_escape_the_workspace() {
         assert!(validate_asset_id("../outside").is_err());
         assert!(validate_asset_id("018f2e40-4d28-7e31-8b63-611d49c43b0b").is_ok());
+    }
+
+    #[test]
+    fn upload_session_expiry_removes_stale_sessions_but_keeps_active_ones() {
+        const ACTIVE_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0b";
+        const STALE_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0c";
+
+        let root = tempdir().unwrap();
+        let workspace = Workspace::open(&root.path().join("workspace")).unwrap();
+        workspace.create_upload_session(ACTIVE_ID, 20).unwrap();
+        workspace.create_upload_session(STALE_ID, 10).unwrap();
+
+        let now = SystemTime::now();
+        let stale_session = workspace.load_upload_session(STALE_ID).unwrap();
+        let old_activity = now - UPLOAD_SESSION_TTL - Duration::from_secs(1);
+        OpenOptions::new()
+            .write(true)
+            .open(stale_session.directory.join(UPLOAD_SESSION_FILENAME))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_activity))
+            .unwrap();
+        workspace.touch_upload_session(ACTIVE_ID).unwrap();
+
+        assert_eq!(
+            workspace.expired_upload_session_ids(now).unwrap(),
+            vec![STALE_ID.to_owned()]
+        );
+        assert!(
+            workspace
+                .remove_upload_session_if_expired(STALE_ID, now)
+                .unwrap()
+        );
+        assert!(
+            !workspace
+                .remove_upload_session_if_expired(ACTIVE_ID, now)
+                .unwrap()
+        );
+        assert_eq!(workspace.upload_session_usage().unwrap(), (1, 20));
+        assert!(workspace.load_upload_session(ACTIVE_ID).is_ok());
+        assert!(workspace.load_upload_session(STALE_ID).is_err());
     }
 
     #[cfg(unix)]

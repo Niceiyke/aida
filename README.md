@@ -103,7 +103,21 @@ $env:STUDIO_API_TOKEN = $token
   --workspace .\workspace
 ```
 
-After staging media with `studio import`, POST a revision-0 timeline JSON to `/v1/projects`; then GET the project or a pinned timeline revision, POST an edit batch to `/v1/projects/{id}/operations`, inspect `/v1/projects/{id}/revisions`, restore an older snapshot, or queue a render. The API runs one SQLite-backed render worker; render jobs pin an immutable revision and support `export` and `preview` presets. For example, from another terminal:
+Upload media directly instead of using `studio import`:
+
+```powershell
+$headers = @{ Authorization = "Bearer $env:STUDIO_API_TOKEN" }
+$source = Get-Item .\clip.mp4
+$upload = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8787/v1/assets/uploads' `
+  -Headers $headers -ContentType 'application/json' `
+  -Body (@{ expectedBytes = $source.Length } | ConvertTo-Json)
+Invoke-WebRequest -Method Put -Uri "http://127.0.0.1:8787$($upload.uploadUrl)" `
+  -Headers $headers -ContentType 'application/octet-stream' -InFile $source.FullName
+$asset = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787$($upload.completeUrl)" `
+  -Headers $headers
+```
+
+After uploading media or staging it with `studio import`, POST a revision-0 timeline JSON to `/v1/projects`; then GET the project or a pinned timeline revision, POST an edit batch to `/v1/projects/{id}/operations`, inspect `/v1/projects/{id}/revisions`, restore an older snapshot, or queue a render. The API runs one SQLite-backed render worker; render jobs pin an immutable revision and support `export` and `preview` presets. For example, from another terminal:
 
 ```powershell
 $env:STUDIO_API_TOKEN = '<paste the same token>'
@@ -133,7 +147,9 @@ if ($job.status -eq 'succeeded') {
 # Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8787/v1/jobs/$jobId/retry" -Headers $headers -ContentType 'application/json' -Body (@{ idempotencyKey = 'retry-render-0001' } | ConvertTo-Json)
 ```
 
-`GET /v1/projects/{id}/revisions` returns the current revision and revision summaries newest-first. `POST /v1/projects/{id}/restore` accepts `{targetRevision, expectedRevision, idempotencyKey}` and creates a new revision from that snapshot; it never rewrites history. A stale `expectedRevision` returns `REVISION_CONFLICT` with the current revision, and a repeated request returns the same new revision. `POST /v1/projects/{id}/renders` accepts `{revision, presetId: "export" | "preview", idempotencyKey}` and returns `{job, replayed}`. Repeat submissions with the same key and request return the same job. `preview` scales down to a maximum 640-pixel edge without upscaling, preserves aspect ratio within even H.264 dimensions, and uses faster/lower-quality encoding; the `export` dimensions and encoding are unchanged. Poll `GET /v1/jobs/{id}` for `queued`, `running`, `succeeded`, `failed`, or `cancelled`; a successful job returns `outputAssetId`, not a local filesystem path. `GET /v1/assets/{id}` returns imported-source metadata and probe information or render-output metadata including `presetId`; `/content` verifies file size and SHA-256 before streaming from that same open file handle. Source assets must still be imported through the CLI; API uploads are not implemented. `POST /v1/jobs/{id}/cancel` is idempotent. `POST /v1/jobs/{id}/retry` accepts `{idempotencyKey}` and creates a new job pinned to the same revision and preset; retries are idempotent and limited to two explicit retries of the latest failed job. If the API stops during a render, the worker cancels the subprocess and leaves the job queued for a later server start; expired worker leases are recovered and partial attempt files are removed.
+`GET /v1/projects/{id}/revisions` returns the current revision and revision summaries newest-first. `POST /v1/projects/{id}/restore` accepts `{targetRevision, expectedRevision, idempotencyKey}` and creates a new revision from that snapshot; it never rewrites history. A stale `expectedRevision` returns `REVISION_CONFLICT` with the current revision, and a repeated request returns the same new revision. `POST /v1/projects/{id}/renders` accepts `{revision, presetId: "export" | "preview", idempotencyKey}` and returns `{job, replayed}`. Repeat submissions with the same key and request return the same job. `preview` scales down to a maximum 640-pixel edge without upscaling, preserves aspect ratio within even H.264 dimensions, and uses faster/lower-quality encoding; the `export` dimensions and encoding are unchanged. Poll `GET /v1/jobs/{id}` for `queued`, `running`, `succeeded`, `failed`, or `cancelled`; a successful job returns `outputAssetId`, not a local filesystem path. `GET /v1/assets/{id}` returns imported-source metadata and probe information or render-output metadata including `presetId`; `/content` verifies file size and SHA-256 before streaming from that same open file handle. To upload media, `POST /v1/assets/uploads` with `{"expectedBytes": <size>}` (1 byte–2 GiB), stream the raw bytes with `PUT` to the returned `uploadUrl`, then `POST` to `completeUrl`. Completion applies the CLI importer’s ffprobe and media limits and is idempotent; `DELETE /v1/assets/uploads/{uploadId}` cancels an incomplete session. Up to four sessions and 2 GiB of aggregate reserved upload data are allowed, and sessions survive API restarts. `POST /v1/jobs/{id}/cancel` is idempotent. `POST /v1/jobs/{id}/retry` accepts `{idempotencyKey}` and creates a new job pinned to the same revision and preset; retries are idempotent and limited to two explicit retries of the latest failed job. If the API stops during a render, the worker cancels the subprocess and leaves the job queued for a later server start; expired worker leases are recovered and partial attempt files are removed.
+
+Upload sessions persist across server restarts but expire after 24 hours without activity. Expired sessions return `410 UPLOAD_EXPIRED`; a new upload request removes expired staging before checking the upload quota.
 
 ## Current limits
 
@@ -143,4 +159,4 @@ if ($job.status -eq 'succeeded') {
 - Local media only; imports are capped at 2 GiB. Render and probe subprocesses have timeouts and generated FFmpeg arguments; arbitrary filtergraph strings and remote URLs are not accepted.
 - Text requires a user-supplied local font. Fonts and media are untrusted inputs to native parsers; use files you trust.
 
-The local SQLite revision/edit/restore/render workflow, revision history, persisted export/preview jobs, source and render-output asset retrieval, retry routes, and loopback project/job API are initial Release A slices. MCP, source-media uploads, and the React editor are not implemented yet.
+The local SQLite revision/edit/restore/render workflow, revision history, persisted export/preview jobs, source and render-output asset retrieval, bounded source-media uploads, retry routes, and loopback project/job API are initial Release A slices. MCP and the React editor are not implemented yet.

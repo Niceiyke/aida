@@ -78,14 +78,17 @@ This remains a partial Release A. It uses bundled SQLite through `rusqlite`; the
 - [ ] Publish OpenAPI contract and generated client.
 - [ ] Extend persistence with API operation/audit records and concurrent-writer load tests; keep CLI and API mutations on the same application service.
 - [x] Add project revision history and idempotent restore as a new immutable revision.
-- [ ] Add remaining source-asset endpoints.
+- [x] Add authenticated source-asset metadata and content endpoints with file-handle integrity verification.
 - [x] Add SQLite-backed in-process export jobs with revision pinning, idempotent enqueue, one worker, cancellation, lease recovery after restart, atomic output publication, and status polling.
 - [x] Add output asset IDs and authenticated streaming retrieval for successful exports.
+- [x] Exercise upload -> project creation -> render job -> authenticated output download with checksum verification end to end.
+- [x] Run the same workflow through the built CLI over a real loopback HTTP socket and verify server startup/shutdown.
 - [x] Add idempotent explicit retries for the latest failed job, bounded to two retries.
 - [x] Add a downscaled preview render preset to the existing persistent job pipeline.
 - [x] Expose imported source asset metadata and content through authenticated API routes.
 - [x] Verify asset size and SHA-256 on an opened file handle before streaming downloads.
-- [ ] Add source-media upload endpoints.
+- [x] Add bounded authenticated upload sessions, raw streaming transfer, ffprobe validation, idempotent completion and cancellation.
+- [x] Expire inactive upload sessions after 24 hours and remove stale staging before reserving new quota.
 - [ ] Implement MCP tools: create_project, import_media, get_timeline, edit_timeline, render, get_job, inspect_output.
 - [ ] Add token scopes, audit trail, structured error mapping and usage limits.
 - [ ] Build scripted agent test with revision conflict recovery.
