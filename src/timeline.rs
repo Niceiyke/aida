@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
+    error::StudioError,
     media::{AssetKind, MAX_IMPORT_BYTES, MAX_PROJECT_SECONDS},
     workspace::{AssetManifest, Workspace, validate_asset_id},
 };
@@ -20,6 +21,8 @@ const MAX_TIMELINE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ASSETS: usize = 100;
 const MAX_TRACKS: usize = 32;
 const MAX_CLIPS: usize = 500;
+pub const MAX_CROSSFADE_SECONDS: u64 = 5;
+pub const MAX_AUDIO_FADE_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -102,8 +105,30 @@ pub struct VideoClip {
     pub source_out: SourceTimestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<Transform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<CropRect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_in: Option<VideoTransition>,
     #[serde(default)]
     pub effects: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum VideoTransition {
+    #[serde(rename = "crossfade")]
+    Crossfade {
+        #[serde(rename = "durationFrames")]
+        duration_frames: u64,
+    },
+}
+
+impl VideoTransition {
+    pub fn duration_frames(&self) -> u64 {
+        match self {
+            Self::Crossfade { duration_frames } => *duration_frames,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +142,10 @@ pub struct AudioClip {
     pub source_out: SourceTimestamp,
     #[serde(default = "default_gain")]
     pub gain: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fade_in_frames: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fade_out_frames: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +174,19 @@ pub struct CaptionClip {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageMotion {
+    #[default]
+    Static,
+    ZoomIn,
+    ZoomOut,
+    PanLeft,
+    PanRight,
+    PanUp,
+    PanDown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageClip {
@@ -152,6 +194,12 @@ pub struct ImageClip {
     pub asset_id: String,
     pub start_frame: u64,
     pub duration_frames: u64,
+    #[serde(default)]
+    pub motion: ImageMotion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<CropRect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_in: Option<VideoTransition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +221,16 @@ pub struct Transform {
     pub scale_y: f64,
     pub rotation_deg: f64,
     pub opacity: f64,
+}
+
+/// A normalized crop rectangle in source-video coordinates, each from 0 to 1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CropRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +389,10 @@ pub fn validate(timeline: Timeline, workspace: &Workspace) -> Result<ValidatedTi
                     validate_clip_range(video.start_frame, video.duration_frames, &timeline)?;
                     validate_video_clip(video, &assets, &timeline)?;
                 }
+                (TrackKind::Video, Clip::Image(image)) => {
+                    validate_clip_range(image.start_frame, image.duration_frames, &timeline)?;
+                    validate_image_clip(image, &assets)?;
+                }
                 (TrackKind::Audio, Clip::Audio(audio)) => {
                     validate_clip_range(audio.start_frame, audio.duration_frames, &timeline)?;
                     validate_audio_clip(audio, &assets, &timeline)?;
@@ -342,7 +404,6 @@ pub fn validate(timeline: Timeline, workspace: &Workspace) -> Result<ValidatedTi
                 (_, Clip::Caption(_)) => {
                     bail!("caption clips are not supported in the first build")
                 }
-                (_, Clip::Image(_)) => bail!("image clips are not supported in the first build"),
                 _ => bail!("clip kind does not match its track kind"),
             }
         }
@@ -354,25 +415,44 @@ pub fn validate(timeline: Timeline, workspace: &Workspace) -> Result<ValidatedTi
     let video_track_index = video_tracks[0];
     let video_track = &timeline.tracks[video_track_index];
     if video_track.clips.is_empty() {
-        bail!("video track must contain at least one clip");
+        bail!("video track must contain at least one visual clip");
     }
-    let mut ordered_video: Vec<&VideoClip> = video_track
+    let mut ordered_video: Vec<&Clip> = video_track
         .clips
         .iter()
-        .filter_map(|clip| match clip {
-            Clip::Video(video) => Some(video),
-            _ => None,
-        })
+        .filter(|clip| matches!(clip, Clip::Video(_) | Clip::Image(_)))
         .collect();
-    ordered_video.sort_by_key(|clip| clip.start_frame);
+    ordered_video.sort_by_key(|clip| clip.start_frame());
     let mut cursor = 0_u64;
+    let mut previous_duration = None;
     for clip in &ordered_video {
-        if clip.start_frame != cursor {
-            bail!("video clips must be contiguous, non-overlapping and start at frame 0");
+        let transition_frames = clip.transition_in_frames();
+        if transition_frames > 0 {
+            let previous_duration = previous_duration
+                .context("the first visual clip cannot have an incoming transition")?;
+            if transition_frames > previous_duration || transition_frames > clip.duration_frames() {
+                bail!("crossfade duration cannot exceed either adjacent visual clip");
+            }
+            let max_transition_frames = MAX_CROSSFADE_SECONDS
+                .saturating_mul(u64::from(timeline.canvas.fps.num))
+                / u64::from(timeline.canvas.fps.den);
+            if transition_frames > max_transition_frames {
+                bail!("crossfade duration cannot exceed five seconds");
+            }
+            if transition_frames > cursor {
+                bail!("crossfade duration exceeds the preceding video sequence");
+            }
         }
-        cursor = cursor
-            .checked_add(clip.duration_frames)
+        let expected_start = cursor - transition_frames;
+        if clip.start_frame() != expected_start {
+            bail!(
+                "visual clips must be contiguous from frame 0; overlaps require a matching incoming crossfade"
+            );
+        }
+        cursor = expected_start
+            .checked_add(clip.duration_frames())
             .ok_or_else(|| anyhow::anyhow!("timeline frame count overflow"))?;
+        previous_duration = Some(clip.duration_frames());
     }
     let total_frames = cursor;
 
@@ -451,6 +531,20 @@ impl Clip {
             Clip::Image(value) => value.duration_frames,
         }
     }
+
+    pub fn transition_in_frames(&self) -> u64 {
+        match self {
+            Clip::Video(value) => value
+                .transition_in
+                .as_ref()
+                .map_or(0, VideoTransition::duration_frames),
+            Clip::Image(value) => value
+                .transition_in
+                .as_ref()
+                .map_or(0, VideoTransition::duration_frames),
+            _ => 0,
+        }
+    }
 }
 
 pub fn frame_boundary_sample(frame: u64, fps: FrameRate, sample_rate: u32) -> Result<u64> {
@@ -518,8 +612,15 @@ fn validate_video_clip(
             clip.id
         );
     }
+    if asset.manifest.kind != AssetKind::Video {
+        bail!("video clip {} must reference a video asset", clip.id);
+    }
     if !clip.effects.is_empty() {
         bail!("effects are not supported by the first renderer");
+    }
+    if let Some(crop) = &clip.crop {
+        validate_crop_rect(crop).context(format!("video clip {} crop is invalid", clip.id))?;
+        validate_crop_size(crop, &asset.manifest.probe.video, &clip.id)?;
     }
     if let Some(transform) = &clip.transform
         && (transform.x != 0.0
@@ -540,6 +641,60 @@ fn validate_video_clip(
     )
 }
 
+fn validate_image_clip(clip: &ImageClip, assets: &BTreeMap<String, ResolvedAsset>) -> Result<()> {
+    let asset = assets
+        .get(&clip.asset_id)
+        .ok_or_else(|| anyhow::anyhow!("image clip {} references a missing asset", clip.id))?;
+    if asset.manifest.kind != AssetKind::Image || !asset.manifest.probe.has_still_image {
+        bail!("image clip {} must reference a still-image asset", clip.id);
+    }
+    if let Some(crop) = &clip.crop {
+        validate_crop_rect(crop).context(format!("image clip {} crop is invalid", clip.id))?;
+        validate_crop_size(crop, &asset.manifest.probe.video, &clip.id)?;
+    }
+    Ok(())
+}
+
+fn validate_crop_size(
+    crop: &CropRect,
+    source: &Option<crate::media::StreamInfo>,
+    id: &str,
+) -> Result<()> {
+    if source
+        .as_ref()
+        .and_then(|video| video.width.zip(video.height))
+        .is_some_and(|(width, height)| {
+            crop.width * f64::from(width) < 2.0 || crop.height * f64::from(height) < 2.0
+        })
+    {
+        bail!("clip {id} crop must include at least 2x2 source pixels");
+    }
+    Ok(())
+}
+
+pub fn validate_crop_rect(crop: &CropRect) -> Result<()> {
+    if !crop.x.is_finite()
+        || !crop.y.is_finite()
+        || !crop.width.is_finite()
+        || !crop.height.is_finite()
+        || crop.x < 0.0
+        || crop.y < 0.0
+        || crop.width <= 0.0
+        || crop.height <= 0.0
+        || crop.x > 1.0
+        || crop.y > 1.0
+        || crop.width > 1.0 - crop.x
+        || crop.height > 1.0 - crop.y
+    {
+        return Err(StudioError::validation(
+            "crop x/y must be within 0..1, width/height must be positive, and the rectangle must stay inside the source frame",
+        )
+        .with_pointer("/crop")
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_audio_clip(
     clip: &AudioClip,
     assets: &BTreeMap<String, ResolvedAsset>,
@@ -556,6 +711,18 @@ fn validate_audio_clip(
     }
     if !clip.gain.is_finite() || !(0.0..=4.0).contains(&clip.gain) {
         bail!("audio gain must be between 0 and 4");
+    }
+    let max_fade_frames = MAX_AUDIO_FADE_SECONDS.saturating_mul(u64::from(timeline.canvas.fps.num))
+        / u64::from(timeline.canvas.fps.den);
+    if clip.fade_in_frames > max_fade_frames || clip.fade_out_frames > max_fade_frames {
+        bail!("audio fades cannot exceed five seconds each");
+    }
+    let combined_fade_frames = clip
+        .fade_in_frames
+        .checked_add(clip.fade_out_frames)
+        .context("audio fade frame count overflowed")?;
+    if combined_fade_frames > clip.duration_frames {
+        bail!("audio fade-in and fade-out cannot overlap or exceed the clip duration");
     }
     validate_source_range(
         &clip.source_in,
@@ -814,6 +981,10 @@ fn default_gain() -> f64 {
     1.0
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 fn default_font_size() -> u32 {
     48
 }
@@ -906,6 +1077,7 @@ mod tests {
                 duration_seconds: 3.0,
                 has_video: true,
                 has_audio: false,
+                has_still_image: false,
                 video: None,
                 audio: None,
             },
@@ -968,5 +1140,80 @@ mod tests {
         ))
         .unwrap();
         assert!(validate_json_schema(&invalid).is_err());
+    }
+
+    #[test]
+    fn image_motion_schema_is_bounded_and_defaults_legacy_clips_to_static() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/timeline-schema-valid.json"))
+                .unwrap();
+        let asset_id = "018f2e40-4d28-7e31-8b63-611d49c43b0b";
+        document["assets"][asset_id]["kind"] = Value::String("image".to_owned());
+        let clip = &mut document["tracks"][0]["clips"][0];
+        clip["kind"] = Value::String("image".to_owned());
+        clip.as_object_mut().unwrap().remove("sourceIn");
+        clip.as_object_mut().unwrap().remove("sourceOut");
+        clip["motion"] = Value::String("zoom_in".to_owned());
+        validate_json_schema(&document).unwrap();
+
+        let legacy_clip = &mut document["tracks"][0]["clips"][0];
+        legacy_clip.as_object_mut().unwrap().remove("motion");
+        let timeline: Timeline = serde_json::from_value(document.clone()).unwrap();
+        assert!(matches!(
+            &timeline.tracks[0].clips[0],
+            Clip::Image(image) if image.motion == ImageMotion::Static
+        ));
+
+        document["tracks"][0]["clips"][0]["motion"] = Value::String("spin".to_owned());
+        assert!(validate_json_schema(&document).is_err());
+    }
+
+    #[test]
+    fn crossfade_schema_accepts_only_the_typed_transition_shape() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/timeline-schema-valid.json"))
+                .unwrap();
+        document["tracks"][0]["clips"][0]["transitionIn"] = serde_json::json!({
+            "type": "crossfade",
+            "durationFrames": 12
+        });
+        validate_json_schema(&document).unwrap();
+
+        document["tracks"][0]["clips"][0]["transitionIn"]["type"] =
+            Value::String("dissolve".to_owned());
+        assert!(validate_json_schema(&document).is_err());
+        document["tracks"][0]["clips"][0]["transitionIn"]["type"] =
+            Value::String("crossfade".to_owned());
+        document["tracks"][0]["clips"][0]["transitionIn"]["durationFrames"] = Value::from(0);
+        assert!(validate_json_schema(&document).is_err());
+    }
+
+    #[test]
+    fn audio_fade_schema_accepts_frame_counts_and_legacy_clips_default_to_no_fade() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/timeline-schema-valid.json"))
+                .unwrap();
+        let asset_id = "018f2e40-4d28-7e31-8b63-611d49c43b0b";
+        document["assets"][asset_id]["kind"] = Value::String("audio".to_owned());
+        document["tracks"][0]["clips"][0]["kind"] = Value::String("audio".to_owned());
+        document["tracks"][0]["clips"][0]["gain"] = Value::from(1.0);
+        document["tracks"][0]["clips"][0]["fadeInFrames"] = Value::from(12);
+        document["tracks"][0]["clips"][0]["fadeOutFrames"] = Value::from(6);
+        validate_json_schema(&document).unwrap();
+
+        let legacy_clip = {
+            let mut legacy = document["tracks"][0]["clips"][0].clone();
+            legacy.as_object_mut().unwrap().remove("fadeInFrames");
+            legacy.as_object_mut().unwrap().remove("fadeOutFrames");
+            legacy
+        };
+        let Clip::Audio(audio) = serde_json::from_value(legacy_clip).unwrap() else {
+            panic!("legacy audio clip must deserialize as audio");
+        };
+        assert_eq!(audio.fade_in_frames, 0);
+        assert_eq!(audio.fade_out_frames, 0);
+
+        document["tracks"][0]["clips"][0]["fadeOutFrames"] = Value::from(-1);
+        assert!(validate_json_schema(&document).is_err());
     }
 }

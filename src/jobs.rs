@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     ProjectStore, RenderRevisionOptions, Workspace,
-    project::{RenderJob, render_revision_with_preset_cancellable},
+    project::{RenderJob, RenderJobPhase, render_revision_with_progress_cancellable},
     render::RenderPreset,
 };
 
@@ -184,9 +184,27 @@ impl RenderJobRunner {
             font: self.font.clone(),
             timeout_seconds: self.timeout_seconds,
         };
+        let progress_store = self.store.clone();
+        let progress_job_id = job.job_id.clone();
+        let progress_worker_id = self.worker_id.clone();
+        let progress: crate::render::RenderProgressCallback = Arc::new(move |phase, percent| {
+            if let Err(error) = progress_store.update_render_job_progress(
+                &progress_job_id,
+                &progress_worker_id,
+                phase,
+                percent,
+            ) {
+                eprintln!("could not update render job progress {progress_job_id}: {error:#}");
+            }
+        });
         let render_flag = Arc::clone(&cancellation_flag);
         let mut render_task: JoinHandle<Result<_>> = tokio::task::spawn_blocking(move || {
-            render_revision_with_preset_cancellable(options, preset, Some(render_flag))
+            render_revision_with_progress_cancellable(
+                options,
+                preset,
+                Some(render_flag),
+                Some(progress),
+            )
         });
         let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
         heartbeat.tick().await;
@@ -241,6 +259,17 @@ impl RenderJobRunner {
                             .requeue_render_job(&job.job_id, &self.worker_id)?;
                     }
                     return Ok(());
+                }
+                if let Err(error) = self.store.update_render_job_progress(
+                    &job.job_id,
+                    &self.worker_id,
+                    RenderJobPhase::Publishing,
+                    98,
+                ) {
+                    eprintln!(
+                        "could not update render job progress {}: {error:#}",
+                        job.job_id
+                    );
                 }
                 let final_dir = match workspace.publish_render_attempt(&job.job_id, job.attempt) {
                     Ok(directory) => directory,
@@ -457,6 +486,73 @@ mod tests {
     }
 
     #[test]
+    fn render_job_progress_is_persisted_and_never_moves_backwards() {
+        let root = tempdir().unwrap();
+        let database = root.path().join("projects.sqlite");
+        let store = ProjectStore::open(&database).unwrap();
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO projects (project_id, current_revision) VALUES (?1, 1)",
+                    [PROJECT_ID],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO revisions (project_id, revision, timeline_json) VALUES (?1, 1, '{}')",
+                    [PROJECT_ID],
+                )
+                .unwrap();
+        }
+        let submitted = store
+            .enqueue_render_job(PROJECT_ID, 1, "export", "progress-test")
+            .unwrap();
+        let claimed = store
+            .claim_next_render_job("progress-worker", JOB_LEASE_SECONDS)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            store
+                .update_render_job_progress(
+                    &claimed.job_id,
+                    "progress-worker",
+                    RenderJobPhase::Encoding,
+                    50,
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_render_job_progress(
+                    &claimed.job_id,
+                    "progress-worker",
+                    RenderJobPhase::Encoding,
+                    20,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .update_render_job_progress(
+                    &claimed.job_id,
+                    "progress-worker",
+                    RenderJobPhase::Validating,
+                    92,
+                )
+                .unwrap()
+        );
+
+        let job = store.get_render_job(&submitted.job.job_id).unwrap();
+        assert_eq!(job.phase, RenderJobPhase::Validating);
+        assert_eq!(job.progress_percent, 92);
+        let json = serde_json::to_value(job).unwrap();
+        assert_eq!(json["phase"], "validating");
+        assert_eq!(json["progressPercent"], 92);
+    }
+
+    #[test]
     fn running_cancellation_is_persisted_until_the_worker_acknowledges_it() {
         let root = tempdir().unwrap();
         let database = root.path().join("projects.sqlite");
@@ -596,6 +692,8 @@ mod tests {
         assert!(runner.run_once().await.unwrap());
         let job = store.get_render_job(&submitted.job.job_id).unwrap();
         assert_eq!(job.status, RenderJobStatus::Succeeded);
+        assert_eq!(job.phase, RenderJobPhase::Complete);
+        assert_eq!(job.progress_percent, 100);
         assert!(job.output_asset_id.is_some());
         let result = job.result.unwrap();
         assert_eq!(result.output_frame_count, 24);

@@ -14,6 +14,7 @@ export interface MediaProbe {
   durationSeconds: number;
   hasVideo: boolean;
   hasAudio: boolean;
+  hasStillImage: boolean;
   video?: StreamInfo;
   audio?: StreamInfo;
 }
@@ -22,7 +23,7 @@ export interface ImportedAsset {
   assetId: string;
   uri?: string;
   sha256: string;
-  kind: "video" | "audio";
+  kind: "video" | "audio" | "image";
   bytes: number;
   fileName?: string;
   mimeType?: string;
@@ -35,12 +36,25 @@ export interface ProjectSummary {
   currentRevision: number;
   createdAt: string;
   updatedAt: string;
+  name?: string;
 }
 
 export interface SourceTimestamp {
   ticks: number;
   timebase_num: number;
   timebase_den: number;
+}
+
+export interface CropRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface VideoTransition {
+  type: "crossfade";
+  durationFrames: number;
 }
 
 export interface VideoClip {
@@ -51,7 +65,29 @@ export interface VideoClip {
   durationFrames: number;
   sourceIn: SourceTimestamp;
   sourceOut: SourceTimestamp;
+  crop?: CropRect;
+  transitionIn?: VideoTransition;
 }
+
+export interface ImageClip {
+  id: string;
+  kind: "image";
+  assetId: string;
+  startFrame: number;
+  durationFrames: number;
+  motion?: ImageMotion;
+  crop?: CropRect;
+  transitionIn?: VideoTransition;
+}
+
+export type ImageMotion =
+  | "static"
+  | "zoom_in"
+  | "zoom_out"
+  | "pan_left"
+  | "pan_right"
+  | "pan_up"
+  | "pan_down";
 
 export interface AudioClip {
   id: string;
@@ -62,6 +98,8 @@ export interface AudioClip {
   sourceIn: SourceTimestamp;
   sourceOut: SourceTimestamp;
   gain: number;
+  fadeInFrames?: number;
+  fadeOutFrames?: number;
 }
 
 export interface TextClip {
@@ -76,7 +114,7 @@ export interface TextClip {
   y: number;
 }
 
-export type TimelineClip = VideoClip | AudioClip | TextClip;
+export type TimelineClip = VideoClip | ImageClip | AudioClip | TextClip;
 export type TrackKind = "video" | "audio" | "overlay";
 
 export interface TimelineTrack {
@@ -98,7 +136,7 @@ export interface TimelineDocument {
     fps: { num: number; den: number };
     background: string;
   };
-  assets: Record<string, { kind: "video" | "audio"; uri: string; sha256: string }>;
+  assets: Record<string, { kind: "video" | "audio" | "image"; uri: string; sha256: string }>;
   tracks: TimelineTrack[];
 }
 
@@ -116,6 +154,11 @@ export interface ProjectRevisionHistory {
 
 export type EditOperation =
   | { type: "clip.add"; trackId: string; clip: TimelineClip; index?: number }
+  | { type: "clip.append"; assetId: string; durationSeconds?: number; sourceInSeconds?: number }
+  | { type: "image.add"; assetId: string; durationSeconds?: number }
+  | { type: "image.motion.set"; clipId: string; motion: ImageMotion }
+  | { type: "clip.transition.set"; clipId: string; durationFrames: number }
+  | { type: "clip.transition.remove"; clipId: string }
   | { type: "clip.remove"; clipId: string }
   | { type: "clip.move"; clipId: string; startFrame: number }
   | { type: "clip.reorder"; clipId: string; destinationIndex: number }
@@ -137,9 +180,11 @@ export type EditOperation =
       x?: number;
       y?: number;
     }
-  | { type: "audio.gain.set"; clipId: string; gain: number };
+  | { type: "audio.gain.set"; clipId: string; gain: number }
+  | { type: "audio.fade.set"; clipId: string; fadeInFrames: number; fadeOutFrames: number };
 
 export type RenderStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type RenderPhase = "queued" | "preparing" | "encoding" | "validating" | "publishing" | "complete";
 
 export interface RenderJob {
   jobId: string;
@@ -147,6 +192,8 @@ export interface RenderJob {
   revision: number;
   presetId: "export" | "preview";
   status: RenderStatus;
+  phase: RenderPhase;
+  progressPercent: number;
   attempt: number;
   cancelRequested: boolean;
   createdAt: string;

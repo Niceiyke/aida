@@ -31,6 +31,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum AssetKind {
     Video,
     Audio,
+    Image,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,8 @@ pub struct MediaProbe {
     pub duration_seconds: f64,
     pub has_video: bool,
     pub has_audio: bool,
+    #[serde(default)]
+    pub has_still_image: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video: Option<StreamInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,11 +133,7 @@ pub fn import_asset(options: ImportOptions) -> Result<ImportedAsset> {
     let (sha256, bytes) = copy_and_hash(&source, &staged_source)?;
     let probe = probe_media(&options.ffprobe, &staged_source)?;
     validate_probe(&probe)?;
-    let kind = if probe.has_video {
-        AssetKind::Video
-    } else {
-        AssetKind::Audio
-    };
+    let kind = asset_kind(&probe)?;
 
     let manifest = AssetManifest {
         schema_version: 1,
@@ -176,11 +175,7 @@ pub(crate) fn complete_uploaded_asset(
     }
     let probe = probe_media(ffprobe, &session.source)?;
     validate_probe(&probe)?;
-    let kind = if probe.has_video {
-        AssetKind::Video
-    } else {
-        AssetKind::Audio
-    };
+    let kind = asset_kind(&probe)?;
     let manifest = AssetManifest {
         schema_version: 1,
         asset_id: upload_id.to_owned(),
@@ -242,36 +237,79 @@ pub(crate) fn probe_media_cancellable(
         .map(to_stream_info)
         .transpose()?;
 
-    let duration = parsed
-        .format
-        .duration
-        .or_else(|| {
-            parsed
-                .streams
-                .iter()
-                .filter_map(|stream| stream.duration.as_deref())
-                .filter_map(|value| value.parse::<f64>().ok())
-                .max_by(f64::total_cmp)
-                .map(|value| value.to_string())
-        })
-        .ok_or_else(|| anyhow::anyhow!("media duration is unavailable"))?;
-    let duration_seconds = duration
-        .parse::<f64>()
-        .context("ffprobe returned an invalid duration")?;
     let format_name = parsed
         .format
         .format_name
         .ok_or_else(|| anyhow::anyhow!("ffprobe did not identify the media container"))?;
+    let has_still_image = video_stream
+        .as_ref()
+        .is_some_and(|video| is_supported_still_image(&format_name, &video.codec));
+    let (duration, duration_seconds) = if has_still_image {
+        ("0".to_owned(), 0.0)
+    } else {
+        let duration = parsed
+            .format
+            .duration
+            .or_else(|| {
+                parsed
+                    .streams
+                    .iter()
+                    .filter_map(|stream| stream.duration.as_deref())
+                    .filter_map(|value| value.parse::<f64>().ok())
+                    .max_by(f64::total_cmp)
+                    .map(|value| value.to_string())
+            })
+            .ok_or_else(|| anyhow::anyhow!("media duration is unavailable"))?;
+        let duration_seconds = duration
+            .parse::<f64>()
+            .context("ffprobe returned an invalid duration")?;
+        (duration, duration_seconds)
+    };
 
     Ok(MediaProbe {
         format_name,
         duration,
         duration_seconds,
-        has_video: video_stream.is_some(),
+        has_video: video_stream.is_some() && !has_still_image,
         has_audio: audio_stream.is_some(),
+        has_still_image,
         video: video_stream,
         audio: audio_stream,
     })
+}
+
+fn asset_kind(probe: &MediaProbe) -> Result<AssetKind> {
+    if probe.has_still_image {
+        Ok(AssetKind::Image)
+    } else if probe.has_video {
+        Ok(AssetKind::Video)
+    } else if probe.has_audio {
+        Ok(AssetKind::Audio)
+    } else {
+        bail!("file has no supported audio, video, or still-image stream")
+    }
+}
+
+fn is_supported_still_image(format_name: &str, codec: &str) -> bool {
+    let formats: Vec<&str> = format_name.split(',').collect();
+    match codec {
+        "mjpeg" => formats
+            .iter()
+            .any(|format| matches!(*format, "jpeg_pipe" | "image2")),
+        "png" => formats
+            .iter()
+            .any(|format| matches!(*format, "png_pipe" | "image2")),
+        "bmp" => formats
+            .iter()
+            .any(|format| matches!(*format, "bmp_pipe" | "image2")),
+        "webp" => formats
+            .iter()
+            .any(|format| matches!(*format, "webp_pipe" | "image2")),
+        "tiff" => formats
+            .iter()
+            .any(|format| matches!(*format, "tiff_pipe" | "image2")),
+        _ => false,
+    }
 }
 
 fn to_stream_info(stream: &ProbeStream) -> Result<StreamInfo> {
@@ -299,6 +337,19 @@ fn to_stream_info(stream: &ProbeStream) -> Result<StreamInfo> {
 }
 
 fn validate_probe(probe: &MediaProbe) -> Result<()> {
+    if probe.has_still_image {
+        if probe.has_video || probe.has_audio {
+            bail!("still-image imports must contain exactly one supported image stream");
+        }
+        let Some(video) = &probe.video else {
+            bail!("still image is missing its image stream");
+        };
+        if !is_supported_still_image(&probe.format_name, &video.codec) {
+            bail!("unsupported still image format; use PNG, JPEG, BMP, WebP, or TIFF");
+        }
+        validate_video_dimensions(video)?;
+        return Ok(());
+    }
     if !probe.has_video && !probe.has_audio {
         bail!("file has no supported audio or video stream");
     }
@@ -319,17 +370,7 @@ fn validate_probe(probe: &MediaProbe) -> Result<()> {
         bail!("unsupported media container; use MP4/MOV video or MP3/WAV/AAC audio");
     }
     if let Some(video) = &probe.video {
-        let (Some(width), Some(height)) = (video.width, video.height) else {
-            bail!("video stream is missing its dimensions");
-        };
-        if width == 0
-            || height == 0
-            || width > MAX_SOURCE_WIDTH
-            || height > MAX_SOURCE_HEIGHT
-            || u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS
-        {
-            bail!("source dimensions exceed the 4K safety limit");
-        }
+        validate_video_dimensions(video)?;
     }
     if let Some(audio) = &probe.audio
         && (audio
@@ -340,6 +381,21 @@ fn validate_probe(probe: &MediaProbe) -> Result<()> {
                 .is_some_and(|channels| channels > MAX_AUDIO_CHANNELS))
     {
         bail!("audio stream exceeds the supported sample-rate or channel limit");
+    }
+    Ok(())
+}
+
+fn validate_video_dimensions(video: &StreamInfo) -> Result<()> {
+    let (Some(width), Some(height)) = (video.width, video.height) else {
+        bail!("video stream is missing its dimensions");
+    };
+    if width == 0
+        || height == 0
+        || width > MAX_SOURCE_WIDTH
+        || height > MAX_SOURCE_HEIGHT
+        || u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS
+    {
+        bail!("source dimensions exceed the 4K safety limit");
     }
     Ok(())
 }
@@ -430,6 +486,7 @@ mod tests {
             duration_seconds: 301.0,
             has_video: true,
             has_audio: false,
+            has_still_image: false,
             video: Some(StreamInfo {
                 codec: "h264".to_owned(),
                 duration_seconds: Some(10.0),
@@ -445,5 +502,59 @@ mod tests {
         probe.duration = "10".to_owned();
         probe.duration_seconds = 10.0;
         assert!(validate_probe(&probe).is_ok());
+    }
+
+    #[test]
+    fn recognizes_only_supported_still_image_streams() {
+        for (format, codec) in [
+            ("jpeg_pipe", "mjpeg"),
+            ("png_pipe", "png"),
+            ("bmp_pipe", "bmp"),
+            ("webp_pipe", "webp"),
+            ("tiff_pipe", "tiff"),
+        ] {
+            let probe = MediaProbe {
+                format_name: format.to_owned(),
+                duration: "0".to_owned(),
+                duration_seconds: 0.0,
+                has_video: false,
+                has_audio: false,
+                has_still_image: true,
+                video: Some(StreamInfo {
+                    codec: codec.to_owned(),
+                    duration_seconds: None,
+                    frame_rate: None,
+                    width: Some(320),
+                    height: Some(240),
+                    sample_rate: None,
+                    channels: None,
+                }),
+                audio: None,
+            };
+            assert!(validate_probe(&probe).is_ok(), "{format}/{codec}");
+            assert_eq!(asset_kind(&probe).unwrap(), AssetKind::Image);
+        }
+
+        let mut unsupported = MediaProbe {
+            format_name: "gif".to_owned(),
+            duration: "0".to_owned(),
+            duration_seconds: 0.0,
+            has_video: false,
+            has_audio: false,
+            has_still_image: true,
+            video: Some(StreamInfo {
+                codec: "gif".to_owned(),
+                duration_seconds: None,
+                frame_rate: None,
+                width: Some(320),
+                height: Some(240),
+                sample_rate: None,
+                channels: None,
+            }),
+            audio: None,
+        };
+        assert!(validate_probe(&unsupported).is_err());
+        unsupported.video.as_mut().unwrap().codec = "png".to_owned();
+        assert!(validate_probe(&unsupported).is_err());
     }
 }

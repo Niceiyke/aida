@@ -799,6 +799,7 @@ mod tests {
                 duration_seconds: 1.0,
                 has_video: false,
                 has_audio: true,
+                has_still_image: false,
                 video: None,
                 audio: None,
             },

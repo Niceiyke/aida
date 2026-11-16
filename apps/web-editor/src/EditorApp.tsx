@@ -4,6 +4,8 @@ import Icon from "./Icon";
 import type {
   AudioClip,
   EditOperation,
+  ImageClip,
+  ImageMotion,
   ImportedAsset,
   ProjectRevisionHistory,
   ProjectSummary,
@@ -20,6 +22,8 @@ import type {
 const TOKEN_KEY = "avida-api-token";
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_PROJECT_SECONDS = 300;
+const MAX_CROSSFADE_SECONDS = 5;
+const MAX_AUDIO_FADE_SECONDS = 5;
 const TERMINAL_JOB_STATES = new Set<RenderJob["status"]>([
   "succeeded",
   "failed",
@@ -54,18 +58,6 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 100 ? 0 : 1)} ${unit}`;
 }
 
-function parseDurationMicroseconds(value: string): number {
-  const match = /^(\d+)(?:\.(\d+))?$/.exec(value);
-  if (!match) throw new Error("The media duration returned by ffprobe is not supported.");
-  const seconds = BigInt(match[1]);
-  const fraction = BigInt((match[2] ?? "").padEnd(6, "0").slice(0, 6) || "0");
-  const microseconds = seconds * 1_000_000n + fraction;
-  if (microseconds <= 0n || microseconds > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new Error("The source media has an invalid duration.");
-  }
-  return Number(microseconds);
-}
-
 function timestampSeconds(timestamp: SourceTimestamp): number {
   return (timestamp.ticks * timestamp.timebase_num) / timestamp.timebase_den;
 }
@@ -82,72 +74,8 @@ function frameRate(timeline: TimelineDocument): number {
   return timeline.canvas.fps.num / timeline.canvas.fps.den;
 }
 
-function fitCanvas(width: number, height: number): [number, number] {
-  const scale = Math.min(1, 1920 / width, 1920 / height, Math.sqrt(2_073_600 / (width * height)));
-  return [
-    Math.max(2, Math.floor((width * scale) / 2) * 2),
-    Math.max(2, Math.floor((height * scale) / 2) * 2),
-  ];
-}
-
-function createTimeline(asset: ImportedAsset): TimelineDocument {
-  if (!asset.probe.hasVideo || !asset.probe.video) {
-    throw new Error("Choose a video to start a project. Audio media can be added after the project is created.");
-  }
-  const sourceDuration = Math.min(parseDurationMicroseconds(asset.probe.duration), MAX_PROJECT_SECONDS * 1_000_000);
-  const fps = 30;
-  const durationFrames = Math.max(1, Math.round((sourceDuration * fps) / 1_000_000));
-  const [width, height] = fitCanvas(asset.probe.video.width ?? 1280, asset.probe.video.height ?? 720);
-  const videoClip: VideoClip = {
-    id: crypto.randomUUID(),
-    kind: "video",
-    assetId: asset.assetId,
-    startFrame: 0,
-    durationFrames,
-    sourceIn: timestampFromSeconds(0),
-    sourceOut: timestampFromSeconds(sourceDuration / 1_000_000),
-  };
-
-  const audioClips: AudioClip[] = [];
-  if (asset.probe.hasAudio && asset.probe.audio) {
-    const audioDuration = Math.min(
-      asset.probe.audio.durationSeconds ?? asset.probe.durationSeconds,
-      sourceDuration / 1_000_000,
-    );
-    const audioFrames = Math.min(durationFrames, Math.max(1, Math.round(audioDuration * fps)));
-    if (audioDuration > 0 && audioFrames > 0) {
-      audioClips.push({
-        id: crypto.randomUUID(),
-        kind: "audio",
-        assetId: asset.assetId,
-        startFrame: 0,
-        durationFrames: audioFrames,
-        sourceIn: timestampFromSeconds(0),
-        sourceOut: timestampFromSeconds(audioDuration),
-        gain: 1,
-      });
-    }
-  }
-
-  return {
-    projectId: crypto.randomUUID(),
-    schemaVersion: "1.0.0",
-    revision: 0,
-    canvas: { width, height, fps: { num: fps, den: 1 }, background: "#101820" },
-    assets: {
-      [asset.assetId]: {
-        kind: asset.kind,
-        uri: asset.uri ?? `asset://${asset.assetId}`,
-        sha256: asset.sha256,
-      },
-    },
-    tracks: [
-      { id: "video-main", kind: "video", order: 0, clips: [videoClip] },
-      { id: "audio-1", kind: "audio", order: 1, clips: audioClips },
-      { id: "audio-2", kind: "audio", order: 2, clips: [] },
-      { id: "titles", kind: "overlay", order: 3, clips: [] },
-    ],
-  };
+function isVisualClip(clip: TimelineClip | null | undefined): clip is VideoClip | ImageClip {
+  return clip?.kind === "video" || clip?.kind === "image";
 }
 
 function clipName(clip: TimelineClip, assets: ImportedAsset[]): string {
@@ -161,12 +89,13 @@ function projectName(
   timeline: TimelineDocument | null,
   assets: ImportedAsset[],
 ): string {
+  if (project.name) return project.name;
   if (timeline?.projectId === project.projectId) {
-    const firstVideo = timeline.tracks
+    const firstVisual = timeline.tracks
       .flatMap((track) => track.clips)
-      .find((clip): clip is VideoClip => clip.kind === "video");
-    if (firstVideo) {
-      const name = assets.find((asset) => asset.assetId === firstVideo.assetId)?.fileName;
+      .find(isVisualClip);
+    if (firstVisual) {
+      const name = assets.find((asset) => asset.assetId === firstVisual.assetId)?.fileName;
       if (name) return name.replace(/\.[^.]+$/, "");
     }
   }
@@ -211,7 +140,12 @@ function App() {
   const [audioTrackId, setAudioTrackId] = useState("audio-1");
   const [sourceInDraft, setSourceInDraft] = useState("");
   const [sourceOutDraft, setSourceOutDraft] = useState("");
+  const [durationFramesDraft, setDurationFramesDraft] = useState(1);
+  const [transitionFramesDraft, setTransitionFramesDraft] = useState(24);
+  const [imageMotionDraft, setImageMotionDraft] = useState<ImageMotion>("static");
   const [gainDraft, setGainDraft] = useState(1);
+  const [audioFadeInDraft, setAudioFadeInDraft] = useState(0);
+  const [audioFadeOutDraft, setAudioFadeOutDraft] = useState(0);
   const [moveFrameDraft, setMoveFrameDraft] = useState(0);
   const [titleDraft, setTitleDraft] = useState("");
   const [fontSizeDraft, setFontSizeDraft] = useState(48);
@@ -321,12 +255,17 @@ function App() {
   );
   const selectedClip = allClips.find((clip) => clip.id === selectedClipId) ?? null;
   const videoTrack = timeline?.tracks.find((track) => track.kind === "video");
-  const firstVideoClip = videoTrack?.clips.find((clip): clip is VideoClip => clip.kind === "video");
+  const visualClips = videoTrack?.clips.filter(isVisualClip) ?? [];
+  const firstVisualClip = visualClips[0];
+  const selectedVisualIndex = isVisualClip(selectedClip)
+    ? visualClips.findIndex((clip) => clip.id === selectedClip.id)
+    : -1;
   const totalFrames = videoTrack?.clips.reduce((end, clip) => Math.max(end, clip.startFrame + clip.durationFrames), 0) ?? 0;
   const fps = timeline ? frameRate(timeline) : 30;
   const selectedProject = projects.find((project) => project.projectId === activeProjectId) ?? null;
   const activeClipAssetId = selectedClip && selectedClip.kind !== "text" ? selectedClip.assetId : "";
-  const monitorAssetId = activeClipAssetId || selectedAssetId || firstVideoClip?.assetId || "";
+  const monitorAssetId = activeClipAssetId || selectedAssetId || firstVisualClip?.assetId || "";
+  const monitorAsset = assets.find((asset) => asset.assetId === monitorAssetId);
   const renderIsCurrent = Boolean(
     timeline && renderJob?.status === "succeeded" && renderJob.revision === timeline.revision && renderedUrl,
   );
@@ -402,7 +341,13 @@ function App() {
   useEffect(() => {
     if (!selectedClip) return;
     setMoveFrameDraft(selectedClip.startFrame);
-    if (selectedClip.kind === "text") {
+    setDurationFramesDraft(selectedClip.durationFrames);
+    if (isVisualClip(selectedClip)) {
+      setTransitionFramesDraft(selectedClip.transitionIn?.durationFrames ?? Math.max(1, Math.round(fps)));
+    }
+    if (selectedClip.kind === "image") {
+      setImageMotionDraft(selectedClip.motion ?? "static");
+    } else if (selectedClip.kind === "text") {
       setTitleDraft(selectedClip.text);
       setFontSizeDraft(selectedClip.fontSize);
       setColorDraft(selectedClip.color);
@@ -411,9 +356,13 @@ function App() {
     } else {
       setSourceInDraft(timestampSeconds(selectedClip.sourceIn).toFixed(3));
       setSourceOutDraft(timestampSeconds(selectedClip.sourceOut).toFixed(3));
-      if (selectedClip.kind === "audio") setGainDraft(selectedClip.gain);
+      if (selectedClip.kind === "audio") {
+        setGainDraft(selectedClip.gain);
+        setAudioFadeInDraft(selectedClip.fadeInFrames ?? 0);
+        setAudioFadeOutDraft(selectedClip.fadeOutFrames ?? 0);
+      }
     }
-  }, [selectedClip?.id, timeline?.revision]);
+  }, [selectedClip?.id, timeline?.revision, fps]);
 
   const refreshLibrary = async () => {
     if (!token) return;
@@ -469,10 +418,9 @@ function App() {
     setBusy(true);
     setError("");
     try {
-      const document = createTimeline(asset);
       const created = await apiRequest<{ projectId: string; revision: number }>(token, "/v1/projects", {
         method: "POST",
-        body: JSON.stringify(document),
+        body: JSON.stringify({ assetIds: [asset.assetId] }),
       });
       await refreshLibrary();
       setUndoStack([]);
@@ -554,49 +502,15 @@ function App() {
 
   const addVideoClip = async (asset: ImportedAsset) => {
     if (!timeline || !videoTrack) return;
-    const position = totalFrames;
-    const availableFrames = Math.floor(MAX_PROJECT_SECONDS * fps) - position;
-    if (availableFrames <= 0) {
+    const remainingFrames = Math.floor(MAX_PROJECT_SECONDS * fps) - totalFrames;
+    if (remainingFrames <= 0) {
       setError("This project has reached the five-minute timeline limit.");
       return;
     }
-    const sourceDuration = parseDurationMicroseconds(asset.probe.duration) / 1_000_000;
-    const durationFrames = Math.min(availableFrames, Math.max(1, Math.round(sourceDuration * fps)));
-    const clipSeconds = Math.min(sourceDuration, durationFrames / fps);
-    const clip: VideoClip = {
-      id: crypto.randomUUID(),
-      kind: "video",
-      assetId: asset.assetId,
-      startFrame: position,
-      durationFrames,
-      sourceIn: timestampFromSeconds(0),
-      sourceOut: timestampFromSeconds(clipSeconds),
-    };
-    const operations: EditOperation[] = [
-      { type: "clip.add", trackId: videoTrack.id, index: videoTrack.clips.length, clip },
-    ];
-    if (asset.probe.hasAudio && asset.probe.audio) {
-      const audioTrack = timeline.tracks.find((track) => track.id === "audio-1") ?? timeline.tracks.find((track) => track.kind === "audio");
-      const audioSeconds = Math.min(asset.probe.audio.durationSeconds ?? sourceDuration, clipSeconds);
-      const audioFrames = Math.min(durationFrames, Math.max(1, Math.round(audioSeconds * fps)));
-      if (audioTrack && audioSeconds > 0) {
-        operations.push({
-          type: "clip.add",
-          trackId: audioTrack.id,
-          clip: {
-            id: crypto.randomUUID(),
-            kind: "audio",
-            assetId: asset.assetId,
-            startFrame: position,
-            durationFrames: audioFrames,
-            sourceIn: timestampFromSeconds(0),
-            sourceOut: timestampFromSeconds(audioSeconds),
-            gain: 1,
-          },
-        });
-      }
-    }
-    await commitOperations(operations, clip.id);
+    const operation: EditOperation = asset.kind === "image"
+      ? { type: "image.add", assetId: asset.assetId }
+      : { type: "clip.append", assetId: asset.assetId };
+    await commitOperations([operation]);
   };
 
   const addAudioClip = async (asset: ImportedAsset) => {
@@ -660,7 +574,7 @@ function App() {
   };
 
   const applyTrim = async () => {
-    if (!selectedClip || selectedClip.kind === "text") return;
+    if (!selectedClip || selectedClip.kind === "text" || selectedClip.kind === "image") return;
     const sourceInSeconds = Number(sourceInDraft);
     const sourceOutSeconds = Number(sourceOutDraft);
     if (!Number.isFinite(sourceInSeconds) || !Number.isFinite(sourceOutSeconds) || sourceInSeconds < 0 || sourceOutSeconds <= sourceInSeconds) {
@@ -678,8 +592,80 @@ function App() {
     }]);
   };
 
+  const applyImageDuration = async () => {
+    if (selectedClip?.kind !== "image") return;
+    if (!Number.isSafeInteger(durationFramesDraft) || durationFramesDraft <= 0) {
+      setError("Image duration must be a positive whole number of frames.");
+      return;
+    }
+    await commitOperations([{
+      type: "clip.trim",
+      clipId: selectedClip.id,
+      startFrame: selectedClip.startFrame,
+      durationFrames: durationFramesDraft,
+    }]);
+  };
+
+  const applyImageMotion = async () => {
+    if (selectedClip?.kind !== "image") return;
+    await commitOperations([{
+      type: "image.motion.set",
+      clipId: selectedClip.id,
+      motion: imageMotionDraft,
+    }]);
+  };
+
+  const applyCrossfade = async () => {
+    if (!isVisualClip(selectedClip)) return;
+    if (selectedVisualIndex <= 0) {
+      setError("The first visual clip cannot have an incoming crossfade.");
+      return;
+    }
+    if (
+      !Number.isSafeInteger(transitionFramesDraft)
+      || transitionFramesDraft <= 0
+      || transitionFramesDraft > Math.floor(MAX_CROSSFADE_SECONDS * fps)
+    ) {
+      setError(`Crossfade duration must be 1–${Math.floor(MAX_CROSSFADE_SECONDS * fps)} frames (up to five seconds).`);
+      return;
+    }
+    await commitOperations([{
+      type: "clip.transition.set",
+      clipId: selectedClip.id,
+      durationFrames: transitionFramesDraft,
+    }]);
+  };
+
+  const removeCrossfade = async () => {
+    if (!isVisualClip(selectedClip) || !selectedClip.transitionIn) return;
+    await commitOperations([{ type: "clip.transition.remove", clipId: selectedClip.id }]);
+  };
+
+  const applyAudioFades = async () => {
+    if (selectedClip?.kind !== "audio") return;
+    const maxFadeFrames = Math.floor(MAX_AUDIO_FADE_SECONDS * fps);
+    if (
+      !Number.isSafeInteger(audioFadeInDraft)
+      || !Number.isSafeInteger(audioFadeOutDraft)
+      || audioFadeInDraft < 0
+      || audioFadeOutDraft < 0
+      || audioFadeInDraft > maxFadeFrames
+      || audioFadeOutDraft > maxFadeFrames
+      || audioFadeInDraft + audioFadeOutDraft > selectedClip.durationFrames
+    ) {
+      setError(`Each audio fade must be 0–${maxFadeFrames} frames, and together they cannot exceed the clip duration.`);
+      return;
+    }
+    await commitOperations([{
+      type: "audio.fade.set",
+      clipId: selectedClip.id,
+      fadeInFrames: audioFadeInDraft,
+      fadeOutFrames: audioFadeOutDraft,
+    }]);
+  };
+
   const applyClipPosition = async () => {
-    if (!selectedClip || selectedClip.kind === "video") return;
+    if (!selectedClip || isVisualClip(selectedClip)) return;
     await commitOperations([{ type: "clip.move", clipId: selectedClip.id, startFrame: Math.max(0, moveFrameDraft) }]);
   };
 
@@ -785,6 +771,7 @@ function App() {
 
   const monitorUrl = renderIsCurrent ? renderedUrl : sourceUrl;
   const monitorLabel = renderIsCurrent ? `RENDERED REVISION ${timeline?.revision}` : "SOURCE PREVIEW · COMPOSITE APPROXIMATE";
+  const monitorIsImage = !renderIsCurrent && monitorAsset?.kind === "image";
 
   return (
     <div className="app-shell">
@@ -823,7 +810,7 @@ function App() {
         ) : (
           <main className="editor-page">
             <div className="editor-heading">
-              <div><div className="eyebrow"><span className="eyebrow-line" /> LOCAL VIDEO STUDIO</div><h1>{selectedProject ? name : "Build a new cut"}</h1><p>{timeline ? "Edit a cut, balance audio, add a title, then render a revision." : "Import video and audio into your local media bin, then start a project from any video."}</p></div>
+                  <div><div className="eyebrow"><span className="eyebrow-line" /> LOCAL VIDEO STUDIO</div><h1>{selectedProject ? name : "Build a new cut"}</h1><p>{timeline ? "Edit a cut, add crossfades, balance audio, add a title, then render a revision." : "Import video, still images, and audio into your local media bin, then start a project from a visual asset."}</p></div>
               {timeline && <div className="editor-revision-actions"><button className="button button-subtle" type="button" onClick={() => void restoreRevision(undoStack[undoStack.length - 1], "undo")} disabled={busy || undoStack.length === 0} title="Undo last edit"><Icon name="refresh" size={15} /> Undo</button><button className="button button-subtle" type="button" onClick={() => void restoreRevision(redoStack[redoStack.length - 1], "redo")} disabled={busy || redoStack.length === 0} title="Redo last edit"><Icon name="refresh" size={15} /> Redo</button><span className="revision-label">REV {timeline.revision}</span></div>}
             </div>
 
@@ -833,16 +820,16 @@ function App() {
               <aside className="editor-rail">
                 <section className="editor-card media-card">
                   <div className="editor-card-heading"><div><div className="section-kicker">MEDIA BIN</div><h2>Media library</h2></div><button className="icon-button" type="button" onClick={() => importInput.current?.click()} disabled={busy} aria-label="Import media"><Icon name="plus" size={17} /></button></div>
-                  <input ref={importInput} className="visually-hidden" type="file" multiple accept="video/*,audio/*,.mp4,.mov,.m4v,.mkv,.mp3,.wav,.aac,.m4a" onChange={(event) => void importFiles(event.target.files)} />
-                  <button className="media-import-button" type="button" onClick={() => importInput.current?.click()} disabled={busy}><Icon name="upload" size={15} /> Import video or audio</button>
+                  <input ref={importInput} className="visually-hidden" type="file" multiple accept="video/*,audio/*,image/png,image/jpeg,image/webp,image/bmp,image/tiff,.mp4,.mov,.m4v,.mkv,.mp3,.wav,.aac,.m4a,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" onChange={(event) => void importFiles(event.target.files)} />
+                  <button className="media-import-button" type="button" onClick={() => importInput.current?.click()} disabled={busy}><Icon name="upload" size={15} /> Import media</button>
                   {timeline && <label className="media-track-select">Add audio to<select value={audioTrackId} onChange={(event) => setAudioTrackId(event.target.value)}>{timeline.tracks.filter((track) => track.kind === "audio").map((track) => <option key={track.id} value={track.id}>{trackTitle(track)}</option>)}</select></label>}
                   {importProgress && <div className="import-progress-copy"><span>{importProgress.fileName}</span><span>{importProgress.percent}%</span><div className="upload-progress"><div style={{ width: `${importProgress.percent}%` }} /></div></div>}
                   <div className="media-list">
                     {assets.length === 0 ? <div className="empty-library">Your imported media will appear here.</div> : assets.map((asset) => (
                       <div className={`media-item ${selectedAssetId === asset.assetId ? "selected" : ""}`} key={asset.assetId}>
-                        <button type="button" className="media-select" onClick={() => setSelectedAssetId(asset.assetId)}><span className={`media-type-icon ${asset.probe.hasVideo ? "video" : "audio"}`}><Icon name={asset.probe.hasVideo ? "film" : "activity"} size={16} /></span><span className="media-copy"><strong title={asset.fileName}>{asset.fileName ?? `${asset.kind} ${asset.assetId.slice(0, 8)}`}</strong><small>{formatDuration(asset.probe.durationSeconds)} · {formatBytes(asset.bytes)}</small></span></button>
-                        {timeline && <div className="media-item-actions">{asset.probe.hasVideo && <button type="button" title="Add video to end of V1" onClick={() => void addVideoClip(asset)} disabled={busy || totalFrames >= Math.floor(MAX_PROJECT_SECONDS * fps)}><Icon name="plus" size={14} /> V1</button>}{asset.probe.hasAudio && <button type="button" title="Add audio at the playhead" onClick={() => void addAudioClip(asset)} disabled={busy || totalFrames === 0}><Icon name="plus" size={14} /> A</button>}</div>}
-                        {!timeline && asset.probe.hasVideo && <button className="media-create-project" type="button" onClick={() => void createProjectFromAsset(asset)} disabled={busy}>Create project</button>}
+                        <button type="button" className="media-select" onClick={() => setSelectedAssetId(asset.assetId)}><span className={`media-type-icon ${asset.kind}`}><Icon name={asset.kind === "audio" ? "activity" : "film"} size={16} /></span><span className="media-copy"><strong title={asset.fileName}>{asset.fileName ?? `${asset.kind} ${asset.assetId.slice(0, 8)}`}</strong><small>{asset.kind === "image" ? `${asset.probe.video?.width ?? "?"} × ${asset.probe.video?.height ?? "?"} · ${formatBytes(asset.bytes)}` : `${formatDuration(asset.probe.durationSeconds)} · ${formatBytes(asset.bytes)}`}</small></span></button>
+                        {timeline && <div className="media-item-actions">{(asset.kind === "video" || asset.kind === "image") && <button type="button" title={asset.kind === "image" ? "Add image to end of V1 (5 seconds)" : "Add video to end of V1"} onClick={() => void addVideoClip(asset)} disabled={busy || totalFrames >= Math.floor(MAX_PROJECT_SECONDS * fps)}><Icon name="plus" size={14} /> V1</button>}{asset.probe.hasAudio && <button type="button" title="Add audio at the playhead" onClick={() => void addAudioClip(asset)} disabled={busy || totalFrames === 0}><Icon name="plus" size={14} /> A</button>}</div>}
+                        {!timeline && asset.kind !== "audio" && <button className="media-create-project" type="button" onClick={() => void createProjectFromAsset(asset)} disabled={busy}>Create project</button>}
                       </div>
                     ))}
                   </div>
@@ -857,15 +844,15 @@ function App() {
               </aside>
 
               <section className="editor-center">
-                {!timeline ? <div className="editor-empty-state"><div className="empty-state-mark"><Icon name="film" size={24} /></div><div className="section-kicker">READY WHEN YOU ARE</div><h2>Start with a video</h2><p>Import more than one video or audio file. Choose a video in the media bin to create a project; your assets stay in the local workspace.</p><button className="button button-primary" type="button" onClick={() => importInput.current?.click()} disabled={busy}><Icon name="upload" size={16} /> Import media</button></div> : <>
+                {!timeline ? <div className="editor-empty-state"><div className="empty-state-mark"><Icon name="film" size={24} /></div><div className="section-kicker">READY WHEN YOU ARE</div><h2>Start with a visual</h2><p>Import videos, still images, or audio. Choose a video or image in the media bin to create a project; images hold for five seconds by default.</p><button className="button button-primary" type="button" onClick={() => importInput.current?.click()} disabled={busy}><Icon name="upload" size={16} /> Import media</button></div> : <>
                   <section className="editor-card monitor-card">
                     <div className="editor-card-heading"><div><div className="section-kicker">PREVIEW MONITOR</div><h2>{renderIsCurrent ? "Rendered cut" : selectedClip ? clipName(selectedClip, assets) : "Source media"}</h2></div><span className={`monitor-badge ${renderIsCurrent ? "rendered" : "approximate"}`}><span />{monitorLabel}</span></div>
-                    <div className="monitor-frame">{monitorUrl ? <video key={monitorUrl} src={monitorUrl} controls playsInline preload="metadata" /> : <div className="monitor-placeholder"><Icon name="video" size={30} /><span>Select media to preview</span></div>}</div>
+                  <div className="monitor-frame">{monitorUrl ? monitorIsImage ? <img key={monitorUrl} src={monitorUrl} alt={monitorAsset?.fileName ?? "Selected still image"} /> : <video key={monitorUrl} src={monitorUrl} controls playsInline preload="metadata" /> : <div className="monitor-placeholder"><Icon name="video" size={30} /><span>Select media to preview</span></div>}</div>
                     <div className="monitor-caption"><Icon name="info" size={14} />{renderIsCurrent ? `Rendered revision ${timeline.revision} · ${renderJob?.presetId} preset` : "Source playback is approximate; use Render preview to inspect the composited timeline."}</div>
                   </section>
 
                   <section className="editor-card timeline-editor-card">
-                    <div className="editor-card-heading timeline-heading"><div><div className="section-kicker">EDITABLE TIMELINE</div><h2>Cut & arrange</h2></div><div className="timeline-tools"><button type="button" className="button button-subtle button-small" onClick={() => void splitSelected()} disabled={busy || !selectedClip}><span className="split-symbol">╫</span> Split</button><button type="button" className="button button-subtle button-small" onClick={() => void addTitle()} disabled={busy || totalFrames <= 0}><Icon name="plus" size={14} /> Title</button><button type="button" className="button button-subtle button-small danger-action" onClick={() => selectedClip && void commitOperations([{ type: "clip.remove", clipId: selectedClip.id }], null)} disabled={busy || !selectedClip || (selectedClip.kind === "video" && (videoTrack?.clips.length ?? 0) <= 1)}><Icon name="x" size={14} /> Remove</button></div></div>
+                    <div className="editor-card-heading timeline-heading"><div><div className="section-kicker">EDITABLE TIMELINE</div><h2>Cut & arrange</h2></div><div className="timeline-tools"><button type="button" className="button button-subtle button-small" onClick={() => void splitSelected()} disabled={busy || !selectedClip}><span className="split-symbol">╫</span> Split</button><button type="button" className="button button-subtle button-small" onClick={() => void addTitle()} disabled={busy || totalFrames <= 0}><Icon name="plus" size={14} /> Title</button><button type="button" className="button button-subtle button-small danger-action" onClick={() => selectedClip && void commitOperations([{ type: "clip.remove", clipId: selectedClip.id }], null)} disabled={busy || !selectedClip || (isVisualClip(selectedClip) && (videoTrack?.clips.length ?? 0) <= 1)}><Icon name="x" size={14} /> Remove</button></div></div>
                     <div className="playhead-control"><span>PLAYHEAD</span><input type="range" min={0} max={Math.max(0, totalFrames)} value={Math.min(playhead, totalFrames)} onChange={(event) => setPlayhead(Number(event.target.value))} disabled={totalFrames === 0} /><output>{formatDuration(playhead / fps)} <small>F{playhead}</small></output></div>
                     <div className="timeline-scroll"><div className="timeline-canvas" style={{ minWidth: `${Math.max(620, totalFrames * 2.2)}px` }}>
                       <div className="timeline-ruler"><span className="track-label-spacer" />{Array.from({ length: 6 }, (_, index) => <span key={index}>{formatDuration((totalFrames / fps) * index / 5)}</span>)}</div>
@@ -876,7 +863,7 @@ function App() {
                             const left = totalFrames ? (clipStart(clip) / totalFrames) * 100 : 0;
                             const width = totalFrames ? Math.max(1.3, (clipDuration(clip) / totalFrames) * 100) : 0;
                             const title = clipName(clip, assets);
-                            return <button key={clip.id} type="button" draggable={clip.kind === "video"} onDragStart={(event) => { event.dataTransfer.setData("text/avida-clip", clip.id); event.dataTransfer.effectAllowed = "move"; }} onDragOver={(event) => { if (clip.kind === "video") event.preventDefault(); }} onDrop={(event) => { if (clip.kind === "video") handleDropOnVideo(event, index); }} onClick={(event) => { event.stopPropagation(); setSelectedClipId(clip.id); setSelectedAssetId(clip.kind === "text" ? "" : clip.assetId); setPlayhead(clip.startFrame); }} className={`timeline-clip clip-${clip.kind} ${selectedClipId === clip.id ? "selected" : ""}`} style={{ left: `${left}%`, width: `${width}%` }} title={`${title} · ${clip.durationFrames} frames`}><span>{title}</span>{clip.kind === "audio" && <small>{Math.round(clip.gain * 100)}%</small>}</button>;
+                           return <button key={clip.id} type="button" draggable={isVisualClip(clip)} onDragStart={(event) => { if (isVisualClip(clip)) { event.dataTransfer.setData("text/avida-clip", clip.id); event.dataTransfer.effectAllowed = "move"; } }} onDragOver={(event) => { if (isVisualClip(clip)) event.preventDefault(); }} onDrop={(event) => { if (isVisualClip(clip)) handleDropOnVideo(event, index); }} onClick={(event) => { event.stopPropagation(); setSelectedClipId(clip.id); setSelectedAssetId(clip.kind === "text" ? "" : clip.assetId); setPlayhead(clip.startFrame); }} className={`timeline-clip clip-${clip.kind} ${isVisualClip(clip) && clip.transitionIn ? "has-incoming-transition" : ""} ${selectedClipId === clip.id ? "selected" : ""}`} style={{ left: `${left}%`, width: `${width}%` }} title={`${title} · ${clip.durationFrames} frames${isVisualClip(clip) && clip.transitionIn ? ` · ${clip.transitionIn.durationFrames}f crossfade` : ""}`}><span>{title}</span>{isVisualClip(clip) && clip.transitionIn && <small className="transition-mark">↔</small>}{clip.kind === "audio" && <small>{Math.round(clip.gain * 100)}%</small>}</button>;
                           })}
                           <span className="timeline-playhead" style={{ left: `${totalFrames ? (playhead / totalFrames) * 100 : 0}%` }} />
                         </div>
@@ -892,10 +879,36 @@ function App() {
                   <section className="editor-card inspector-card">
                     <div className="editor-card-heading"><div><div className="section-kicker">INSPECTOR</div><h2>{selectedClip ? "Clip properties" : "Project"}</h2></div></div>
                     {selectedClip ? <>
-                      <div className="inspector-clip-name"><span className={`media-type-icon ${selectedClip.kind}`}>{selectedClip.kind === "video" ? <Icon name="film" size={15} /> : selectedClip.kind === "audio" ? <Icon name="activity" size={15} /> : <Icon name="file" size={15} />}</span><span>{clipName(selectedClip, assets)}</span></div>
-                      <div className="inspector-field-row"><label>Start frame</label>{selectedClip.kind === "video" ? <output>{selectedClip.startFrame}</output> : <div className="inline-number"><input type="number" min={0} max={Math.max(0, totalFrames - selectedClip.durationFrames)} value={moveFrameDraft} onChange={(event) => setMoveFrameDraft(Number(event.target.value))} /><button type="button" onClick={() => void applyClipPosition()} disabled={busy}>Move</button></div>}</div>
+                      <div className="inspector-clip-name"><span className={`media-type-icon ${selectedClip.kind}`}>{selectedClip.kind === "audio" ? <Icon name="activity" size={15} /> : selectedClip.kind === "text" ? <Icon name="file" size={15} /> : <Icon name="film" size={15} />}</span><span>{clipName(selectedClip, assets)}</span></div>
+                      <div className="inspector-field-row"><label>Start frame</label>{isVisualClip(selectedClip) ? <output>{selectedClip.startFrame}</output> : <div className="inline-number"><input type="number" min={0} max={Math.max(0, totalFrames - selectedClip.durationFrames)} value={moveFrameDraft} onChange={(event) => setMoveFrameDraft(Number(event.target.value))} /><button type="button" onClick={() => void applyClipPosition()} disabled={busy}>Move</button></div>}</div>
                       <div className="inspector-field-row"><label>Duration</label><output>{(selectedClip.durationFrames / fps).toFixed(2)}s · {selectedClip.durationFrames}f</output></div>
-                      {selectedClip.kind !== "text" && <>
+                      {isVisualClip(selectedClip) && <>
+                        <div className="inspector-section-label">INCOMING TRANSITION</div>
+                        {selectedVisualIndex <= 0 ? <p className="inspector-help">The first visual clip cannot have an incoming crossfade.</p> : <>
+                          <div className="inspector-field-row"><label htmlFor="crossfade-frames">Crossfade (frames)</label><input id="crossfade-frames" type="number" min={1} max={Math.floor(MAX_CROSSFADE_SECONDS * fps)} step={1} value={transitionFramesDraft} onChange={(event) => setTransitionFramesDraft(Number(event.target.value))} /></div>
+                          <p className="inspector-help">Up to five seconds; the duration must fit both adjacent clips. The overlap shortens the total cut.</p>
+                          <button className="button button-subtle inspector-apply" type="button" onClick={() => void applyCrossfade()} disabled={busy}>Apply crossfade</button>
+                          {selectedClip.transitionIn && <button className="button button-subtle inspector-apply" type="button" onClick={() => void removeCrossfade()} disabled={busy}>Remove crossfade</button>}
+                        </>}
+                      </>}
+                      {selectedClip.kind === "image" && <>
+                        <div className="inspector-section-label">IMAGE MOTION</div>
+                        <label className="inspector-label" htmlFor="image-motion">Movement</label>
+                        <select id="image-motion" value={imageMotionDraft} onChange={(event) => setImageMotionDraft(event.target.value as ImageMotion)}>
+                          <option value="static">Static</option>
+                          <option value="zoom_in">Gentle zoom in</option>
+                          <option value="zoom_out">Gentle zoom out</option>
+                          <option value="pan_left">Pan left</option>
+                          <option value="pan_right">Pan right</option>
+                          <option value="pan_up">Pan up</option>
+                          <option value="pan_down">Pan down</option>
+                        </select>
+                        <button className="button button-subtle inspector-apply" type="button" onClick={() => void applyImageMotion()} disabled={busy}>Apply motion</button>
+                        <div className="inspector-section-label">IMAGE HOLD</div>
+                        <div className="inspector-field-row"><label htmlFor="image-duration-frames">Duration (frames)</label><input id="image-duration-frames" type="number" min={1} max={Math.floor(MAX_PROJECT_SECONDS * fps)} step={1} value={durationFramesDraft} onChange={(event) => setDurationFramesDraft(Number(event.target.value))} /></div>
+                        <button className="button button-subtle inspector-apply" type="button" onClick={() => void applyImageDuration()} disabled={busy}>Apply duration</button>
+                      </>}
+                      {selectedClip.kind !== "text" && selectedClip.kind !== "image" && <>
                         <div className="inspector-section-label">SOURCE TRIM</div>
                         <div className="inspector-field-row"><label htmlFor="source-in">In (seconds)</label><input id="source-in" type="number" min={0} step={0.001} value={sourceInDraft} onChange={(event) => setSourceInDraft(event.target.value)} /></div>
                         <div className="inspector-field-row"><label htmlFor="source-out">Out (seconds)</label><input id="source-out" type="number" min={0} step={0.001} value={sourceOutDraft} onChange={(event) => setSourceOutDraft(event.target.value)} /></div>
@@ -904,6 +917,11 @@ function App() {
                       {selectedClip.kind === "audio" && <>
                         <div className="inspector-section-label">AUDIO</div>
                         <div className="gain-line"><label htmlFor="clip-gain">Gain</label><output>{gainDraft.toFixed(2)}×</output></div><input className="gain-range" id="clip-gain" type="range" min={0} max={4} step={0.05} value={gainDraft} onChange={(event) => setGainDraft(Number(event.target.value))} /><button className="button button-subtle inspector-apply" type="button" onClick={() => void applyClipProperties()} disabled={busy}>Apply gain</button>
+                        <div className="inspector-section-label">LINEAR FADES</div>
+                        <div className="inspector-field-row"><label htmlFor="audio-fade-in">Fade in (frames)</label><input id="audio-fade-in" type="number" min={0} max={Math.floor(MAX_AUDIO_FADE_SECONDS * fps)} step={1} value={audioFadeInDraft} onChange={(event) => setAudioFadeInDraft(Number(event.target.value))} /></div>
+                        <div className="inspector-field-row"><label htmlFor="audio-fade-out">Fade out (frames)</label><input id="audio-fade-out" type="number" min={0} max={Math.floor(MAX_AUDIO_FADE_SECONDS * fps)} step={1} value={audioFadeOutDraft} onChange={(event) => setAudioFadeOutDraft(Number(event.target.value))} /></div>
+                        <p className="inspector-help">Each fade is up to five seconds. Fade durations cannot overlap or exceed the clip length.</p>
+                        <button className="button button-subtle inspector-apply" type="button" onClick={() => void applyAudioFades()} disabled={busy}>Apply fades</button>
                       </>}
                       {selectedClip.kind === "text" && <>
                         <div className="inspector-section-label">TITLE</div>
@@ -921,7 +939,10 @@ function App() {
                     <p>Preview and export run through the local render worker.</p>
                     <button className="render-choice" type="button" onClick={() => void render("preview")} disabled={busy || Boolean(renderJob && !TERMINAL_JOB_STATES.has(renderJob.status))}><span className="render-choice-icon preview-icon"><Icon name="play" size={15} /></span><span className="render-choice-copy"><strong>Render preview</strong><small>640 px · revision {timeline.revision}</small></span><Icon name="arrow-up-right" size={14} /></button>
                     <button className="render-choice" type="button" onClick={() => void render("export")} disabled={busy || Boolean(renderJob && !TERMINAL_JOB_STATES.has(renderJob.status))}><span className="render-choice-icon export-icon"><Icon name="arrow-down" size={15} /></span><span className="render-choice-copy"><strong>Final export</strong><small>{timeline.canvas.width} × {timeline.canvas.height} · H.264</small></span><Icon name="arrow-up-right" size={14} /></button>
-                    {renderJob && <div className={`render-state render-${renderJob.status}`}><span><strong>{renderJob.status === "succeeded" ? "Render ready" : renderJob.status === "failed" ? "Render failed" : renderJob.status === "cancelled" ? "Render cancelled" : `${renderJob.presetId} ${renderJob.status}`}</strong><small>{renderJob.error ?? `Revision ${renderJob.revision}`}</small></span><div>{renderJob.status === "succeeded" && <button type="button" onClick={() => void downloadRender()}>Download</button>}{(renderJob.status === "queued" || renderJob.status === "running") && <button type="button" onClick={() => void cancelRender()}>Cancel</button>}{renderJob.status === "failed" && <button type="button" onClick={() => void retryRender()} disabled={busy}>Retry</button>}</div></div>}
+                     {renderJob && <>
+                       <div className={`render-state render-${renderJob.status}`}><span><strong>{renderJob.status === "succeeded" ? "Render ready" : renderJob.status === "failed" ? "Render failed" : renderJob.status === "cancelled" ? "Render cancelled" : `${renderJob.presetId} ${renderJob.status}`}</strong><small>{renderJob.error ?? `Revision ${renderJob.revision} · ${renderJob.phase.replaceAll("_", " ")}${renderJob.status === "running" ? ` · ${renderJob.progressPercent}%` : ""}`}</small></span><div>{renderJob.status === "succeeded" && <button type="button" onClick={() => void downloadRender()}>Download</button>}{(renderJob.status === "queued" || renderJob.status === "running") && <button type="button" onClick={() => void cancelRender()}>Cancel</button>}{renderJob.status === "failed" && <button type="button" onClick={() => void retryRender()} disabled={busy}>Retry</button>}</div></div>
+                       {(renderJob.status === "queued" || renderJob.status === "running") && <div className="render-progress" role="progressbar" aria-label={`Render ${renderJob.phase}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={renderJob.progressPercent}><div style={{ width: `${renderJob.progressPercent}%` }} /></div>}
+                     </>}
                     <div className="render-security"><Icon name="lock" size={13} /><span>Private render · stored in your workspace</span></div>
                   </section>
                 </>}

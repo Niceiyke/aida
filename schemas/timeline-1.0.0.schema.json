@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://avida.local/schemas/timeline-1.0.0.schema.json",
   "title": "Avida timeline 1.0.0",
-  "description": "Machine-readable timeline shape for the first local CLI release. Semantic checks additionally validate asset references, source duration, track layout and renderer support.",
+  "description": "Machine-readable timeline schema for the supported renderer. Semantic checks additionally validate asset references, source duration, crop bounds, track layout and renderer support.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "projectId", "revision", "canvas", "assets", "tracks"],
@@ -55,7 +55,7 @@
       "additionalProperties": false,
       "required": ["kind", "uri", "sha256"],
       "properties": {
-        "kind": { "enum": ["video", "audio"] },
+        "kind": { "enum": ["video", "audio", "image"] },
         "uri": { "type": "string", "pattern": "^asset://[0-9a-fA-F-]{36}$" },
         "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
       }
@@ -66,7 +66,7 @@
       "required": ["id", "kind", "order"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
-        "kind": { "enum": ["video", "audio", "overlay", "caption"] },
+        "kind": { "enum": ["video", "audio", "overlay"] },
         "order": { "type": "integer" },
         "enabled": { "type": "boolean", "default": true },
         "locked": { "type": "boolean", "default": false },
@@ -76,10 +76,9 @@
     "clip": {
       "oneOf": [
         { "$ref": "#/$defs/videoClip" },
+        { "$ref": "#/$defs/imageClip" },
         { "$ref": "#/$defs/audioClip" },
-        { "$ref": "#/$defs/textClip" },
-        { "$ref": "#/$defs/captionClip" },
-        { "$ref": "#/$defs/imageClip" }
+        { "$ref": "#/$defs/textClip" }
       ]
     },
     "clipBase": {
@@ -113,6 +112,32 @@
         "opacity": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
+    "cropRect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height"],
+      "description": "Normalized crop rectangle in source-media coordinates. x, y, width and height are fractions from 0 to 1; semantic validation ensures the rectangle stays within the source frame.",
+      "properties": {
+        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y": { "type": "number", "minimum": 0, "maximum": 1 },
+        "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+      }
+    },
+    "videoTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "durationFrames"],
+      "properties": {
+        "type": { "const": "crossfade" },
+        "durationFrames": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 150,
+          "description": "Incoming crossfade length in project frames; semantic validation caps this at five seconds and checks both adjacent clips."
+        }
+      }
+    },
     "videoClip": {
       "allOf": [
         { "$ref": "#/$defs/clipBase" },
@@ -123,6 +148,8 @@
             "kind": { "const": "video" }, "assetId": { "$ref": "#/$defs/uuid" },
             "sourceIn": { "$ref": "#/$defs/sourceTimestamp" }, "sourceOut": { "$ref": "#/$defs/sourceTimestamp" },
             "transform": { "$ref": "#/$defs/transform" },
+            "crop": { "$ref": "#/$defs/cropRect" },
+            "transitionIn": { "$ref": "#/$defs/videoTransition" },
             "effects": { "type": "array", "maxItems": 0 }
           }
         }
@@ -138,7 +165,9 @@
           "properties": {
             "kind": { "const": "audio" }, "assetId": { "$ref": "#/$defs/uuid" },
             "sourceIn": { "$ref": "#/$defs/sourceTimestamp" }, "sourceOut": { "$ref": "#/$defs/sourceTimestamp" },
-            "gain": { "type": "number", "minimum": 0, "maximum": 4, "default": 1 }
+            "gain": { "type": "number", "minimum": 0, "maximum": 4, "default": 1 },
+            "fadeInFrames": { "type": "integer", "minimum": 0, "default": 0, "description": "Linear fade-in duration in project frames; semantically limited to five seconds at the project frame rate." },
+            "fadeOutFrames": { "type": "integer", "minimum": 0, "default": 0, "description": "Linear fade-out duration in project frames; semantically limited to five seconds at the project frame rate." }
           }
         }
       ],
@@ -167,10 +196,16 @@
       ],
       "unevaluatedProperties": false
     },
+    "imageMotion": {
+      "type": "string",
+      "enum": ["static", "zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"],
+      "default": "static",
+      "description": "A bounded, gentle motion preset applied over the still-image clip duration."
+    },
     "imageClip": {
       "allOf": [
         { "$ref": "#/$defs/clipBase" },
-        { "type": "object", "required": ["assetId"], "properties": { "kind": { "const": "image" }, "assetId": { "$ref": "#/$defs/uuid" } } }
+        { "type": "object", "required": ["assetId"], "properties": { "kind": { "const": "image" }, "assetId": { "$ref": "#/$defs/uuid" }, "crop": { "$ref": "#/$defs/cropRect" }, "motion": { "$ref": "#/$defs/imageMotion" }, "transitionIn": { "$ref": "#/$defs/videoTransition" } } }
       ],
       "unevaluatedProperties": false
     },

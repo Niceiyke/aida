@@ -37,8 +37,13 @@ use uuid::Uuid;
 use crate::{
     AssetKind, EditOperation, EditResult, ImportedAsset, MediaProbe, ProjectRestoreResult,
     ProjectRevision, ProjectRevisionHistory, ProjectStore, ProjectSummary, RenderJob, Workspace,
+    capabilities::{capabilities, openapi_document, timeline_schema},
+    error::{StudioError, find_studio_error, legacy_error_code},
+    inspect::{Inspection, ensure_still, inspect_job},
     jobs::{JobCancellationRegistry, RenderJobRunner},
     media::{MAX_IMPORT_BYTES, complete_uploaded_asset},
+    render::validate_configured_font,
+    timeline::Timeline,
     workspace::{sanitize_media_file_name, validate_asset_id},
 };
 
@@ -62,6 +67,8 @@ struct ApiState {
     store: ProjectStore,
     workspace: PathBuf,
     ffprobe: PathBuf,
+    ffmpeg: PathBuf,
+    font_configured: bool,
     cancellation: JobCancellationRegistry,
     uploads: UploadControl,
 }
@@ -102,6 +109,22 @@ struct EditRequest {
 #[serde(deny_unknown_fields)]
 struct TimelineQuery {
     revision: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JobsQuery {
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BootstrapProjectRequest {
+    asset_ids: Vec<String>,
+    #[serde(default)]
+    preset_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,10 +237,17 @@ struct ErrorDocument {
     retryable: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ErrorDetails {
-    current_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pointer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual: Option<String>,
 }
 
 #[derive(Debug)]
@@ -225,7 +255,8 @@ struct ApiError {
     status: StatusCode,
     code: String,
     message: String,
-    current_revision: Option<u64>,
+    details: Option<Box<ErrorDetails>>,
+    retryable: bool,
 }
 
 impl ApiError {
@@ -234,31 +265,65 @@ impl ApiError {
             status,
             code: code.to_owned(),
             message: message.into(),
-            current_revision: None,
+            details: None,
+            retryable: false,
         }
     }
 
     fn from_anyhow(error: anyhow::Error) -> Self {
         let details = format!("{error:#}");
-        let (status, code, message) = if details.contains("REVISION_CONFLICT") {
+        if let Some(studio) = find_studio_error(&error) {
+            let status = match studio.code {
+                "ASSET_NOT_FOUND" | "PROJECT_NOT_FOUND" | "JOB_NOT_FOUND"
+                | "REVISION_NOT_FOUND" => StatusCode::NOT_FOUND,
+                "REVISION_CONFLICT"
+                | "IDEMPOTENCY_CONFLICT"
+                | "PROJECT_EXISTS"
+                | "JOB_NOT_RETRYABLE"
+                | "JOB_RETRY_LIMIT" => StatusCode::CONFLICT,
+                "PAYLOAD_TOO_LARGE" => StatusCode::PAYLOAD_TOO_LARGE,
+                "PERMISSION_DENIED" => StatusCode::FORBIDDEN,
+                _ => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            return Self {
+                status,
+                code: studio.code.to_owned(),
+                message: studio.message.clone(),
+                details: (studio.current_revision.is_some()
+                    || studio.pointer.is_some()
+                    || studio.expected.is_some()
+                    || studio.actual.is_some())
+                .then(|| {
+                    Box::new(ErrorDetails {
+                        current_revision: studio.current_revision,
+                        pointer: studio.pointer.clone(),
+                        expected: studio.expected.clone(),
+                        actual: studio.actual.clone(),
+                    })
+                }),
+                retryable: studio.retryable,
+            };
+        }
+        let code_prefix = legacy_error_code(&error);
+        let (status, code, message) = if code_prefix == Some("REVISION_CONFLICT") {
             (StatusCode::CONFLICT, "REVISION_CONFLICT", details)
-        } else if details.contains("IDEMPOTENCY_CONFLICT") {
+        } else if code_prefix == Some("IDEMPOTENCY_CONFLICT") {
             (StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT", details)
-        } else if details.contains("PROJECT_EXISTS") {
+        } else if code_prefix == Some("PROJECT_EXISTS") {
             (StatusCode::CONFLICT, "PROJECT_EXISTS", details)
-        } else if details.contains("PROJECT_NOT_FOUND") {
+        } else if code_prefix == Some("PROJECT_NOT_FOUND") {
             (StatusCode::NOT_FOUND, "PROJECT_NOT_FOUND", details)
-        } else if details.contains("REVISION_NOT_FOUND") {
+        } else if code_prefix == Some("REVISION_NOT_FOUND") {
             (StatusCode::NOT_FOUND, "REVISION_NOT_FOUND", details)
-        } else if details.contains("JOB_NOT_FOUND") {
+        } else if code_prefix == Some("JOB_NOT_FOUND") {
             (StatusCode::NOT_FOUND, "JOB_NOT_FOUND", details)
-        } else if details.contains("ASSET_NOT_FOUND") {
+        } else if code_prefix == Some("ASSET_NOT_FOUND") {
             (StatusCode::NOT_FOUND, "ASSET_NOT_FOUND", details)
-        } else if details.contains("UPLOAD_NOT_FOUND") {
+        } else if code_prefix == Some("UPLOAD_NOT_FOUND") {
             (StatusCode::NOT_FOUND, "UPLOAD_NOT_FOUND", details)
-        } else if details.contains("JOB_NOT_RETRYABLE") {
+        } else if code_prefix == Some("JOB_NOT_RETRYABLE") {
             (StatusCode::CONFLICT, "JOB_NOT_RETRYABLE", details)
-        } else if details.contains("JOB_RETRY_LIMIT") {
+        } else if code_prefix == Some("JOB_RETRY_LIMIT") {
             (StatusCode::CONFLICT, "JOB_RETRY_LIMIT", details)
         } else if error
             .chain()
@@ -280,7 +345,8 @@ impl ApiError {
             status,
             code: code.to_owned(),
             message,
-            current_revision: None,
+            details: None,
+            retryable: false,
         }
     }
 
@@ -295,7 +361,8 @@ impl ApiError {
             status,
             code: code.to_owned(),
             message: error.body_text(),
-            current_revision: None,
+            details: None,
+            retryable: false,
         }
     }
 
@@ -304,7 +371,8 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_QUERY".to_owned(),
             message: error.body_text(),
-            current_revision: None,
+            details: None,
+            retryable: false,
         }
     }
 
@@ -313,7 +381,8 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "PERMISSION_DENIED".to_owned(),
             message: "A valid Bearer token is required".to_owned(),
-            current_revision: None,
+            details: None,
+            retryable: false,
         }
     }
 
@@ -322,7 +391,17 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "INTERNAL_ERROR".to_owned(),
             message: message.to_owned(),
-            current_revision: None,
+            details: None,
+            retryable: false,
+        }
+    }
+
+    fn set_current_revision(&mut self, current_revision: Option<u64>) {
+        if let Some(current_revision) = current_revision {
+            let details = self
+                .details
+                .get_or_insert_with(|| Box::new(ErrorDetails::default()));
+            details.current_revision = Some(current_revision);
         }
     }
 }
@@ -335,16 +414,13 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let details = self
-            .current_revision
-            .map(|current_revision| ErrorDetails { current_revision });
         let body = ErrorEnvelope {
             error: ErrorDocument {
                 code: self.code,
                 message: self.message,
                 request_id: Uuid::new_v4().to_string(),
-                details,
-                retryable: false,
+                details: self.details.map(|details| *details),
+                retryable: self.retryable,
             },
         };
         (self.status, Json(body)).into_response()
@@ -359,10 +435,15 @@ pub async fn serve_api(options: ApiServerOptions) -> Result<()> {
         bail!("timeout-seconds must be between 1 and 3600");
     }
     validate_bearer_token(&options.bearer_token)?;
+    if let Some(font) = options.font.as_deref() {
+        validate_configured_font(font).context("configured font is not usable")?;
+    }
     let workspace = Workspace::open(&options.workspace)?;
     let store = ProjectStore::open(&options.database)?;
     let cancellation = JobCancellationRegistry::default();
     let ffprobe = options.ffprobe.clone();
+    let ffmpeg = options.ffmpeg.clone();
+    let font_configured = options.font.is_some();
     let runner = RenderJobRunner::new(
         store.clone(),
         workspace.root().to_path_buf(),
@@ -372,10 +453,12 @@ pub async fn serve_api(options: ApiServerOptions) -> Result<()> {
         options.timeout_seconds,
         cancellation.clone(),
     );
-    let app = build_router(
+    let app = build_router_with_config(
         store,
         workspace.root().to_path_buf(),
         ffprobe,
+        ffmpeg,
+        font_configured,
         options.bearer_token,
         cancellation,
     );
@@ -405,6 +488,7 @@ fn validate_bearer_token(token: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn build_router(
     store: ProjectStore,
     workspace: PathBuf,
@@ -412,15 +496,40 @@ fn build_router(
     bearer_token: String,
     cancellation: JobCancellationRegistry,
 ) -> Router {
+    build_router_with_config(
+        store,
+        workspace,
+        ffprobe,
+        PathBuf::from("ffmpeg"),
+        true,
+        bearer_token,
+        cancellation,
+    )
+}
+
+fn build_router_with_config(
+    store: ProjectStore,
+    workspace: PathBuf,
+    ffprobe: PathBuf,
+    ffmpeg: PathBuf,
+    font_configured: bool,
+    bearer_token: String,
+    cancellation: JobCancellationRegistry,
+) -> Router {
     let state = ApiState {
         store,
         workspace,
         ffprobe,
+        ffmpeg,
+        font_configured,
         cancellation,
         uploads: UploadControl::default(),
     };
     Router::new()
         .route("/v1/health", get(get_health))
+        .route("/v1/capabilities", get(get_capabilities))
+        .route("/v1/schemas/timeline", get(get_timeline_schema))
+        .route("/v1/openapi.json", get(get_openapi))
         .route("/v1/projects", get(list_projects).post(create_project))
         .route("/v1/projects/{project_id}", get(get_project))
         .route("/v1/projects/{project_id}/timeline", get(get_timeline))
@@ -437,6 +546,9 @@ fn build_router(
             post(apply_operations),
         )
         .route("/v1/projects/{project_id}/renders", post(enqueue_render))
+        .route("/v1/jobs", get(list_jobs))
+        .route("/v1/jobs/{job_id}/inspection", get(inspect_render_job))
+        .route("/v1/jobs/{job_id}/stills/{frame}", get(get_render_still))
         .route("/v1/jobs/{job_id}", get(get_render_job))
         .route("/v1/jobs/{job_id}/cancel", post(cancel_render_job))
         .route("/v1/jobs/{job_id}/retry", post(retry_render_job))
@@ -466,6 +578,35 @@ fn build_router(
 
 async fn get_health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn get_capabilities(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(capabilities(
+            state.font_configured,
+            &state.ffmpeg,
+            &state.ffprobe,
+        ))
+        .unwrap_or_else(|_| serde_json::json!({"error": "could not serialize capabilities"})),
+    )
+}
+
+async fn get_timeline_schema() -> Json<serde_json::Value> {
+    Json(timeline_schema())
+}
+
+async fn get_openapi() -> Json<serde_json::Value> {
+    Json(openapi_document())
+}
+
+async fn list_jobs(
+    State(state): State<ApiState>,
+    query: std::result::Result<Query<JobsQuery>, QueryRejection>,
+) -> std::result::Result<Json<Vec<RenderJob>>, ApiError> {
+    let Query(query) = query.map_err(ApiError::from_query_rejection)?;
+    Ok(Json(
+        state.store.list_render_jobs(query.project_id.as_deref())?,
+    ))
 }
 
 async fn list_projects(
@@ -531,12 +672,38 @@ async fn create_project(
     payload: std::result::Result<Json<Value>, JsonRejection>,
 ) -> std::result::Result<(StatusCode, Json<ProjectRevision>), ApiError> {
     let Json(document) = payload.map_err(ApiError::from_json_rejection)?;
+    if !state.font_configured && timeline_document_has_text(&document) {
+        return Err(ApiError::from_anyhow(
+            StudioError::new(
+                "FONT_REQUIRED",
+                "text clips require the API to be started with --font <font-file>",
+            )
+            .with_pointer("/tracks")
+            .into(),
+        ));
+    }
     let store = state.store;
     let workspace = state.workspace;
-    let result =
+    let result = if document.get("assetIds").is_some() {
+        let request: BootstrapProjectRequest =
+            serde_json::from_value(document).map_err(|error| {
+                ApiError::from_anyhow(StudioError::validation(error.to_string()).into())
+            })?;
+        tokio::task::spawn_blocking(move || {
+            store.create_from_asset_ids(
+                &workspace,
+                &request.asset_ids,
+                request.preset_id,
+                request.name,
+            )
+        })
+        .await
+        .map_err(|_| ApiError::internal("The project worker did not complete the request"))??
+    } else {
         tokio::task::spawn_blocking(move || store.create_from_timeline_json(&workspace, document))
             .await
-            .map_err(|_| ApiError::internal("The project worker did not complete the request"))??;
+            .map_err(|_| ApiError::internal("The project worker did not complete the request"))??
+    };
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -578,6 +745,23 @@ async fn restore_project_revision(
     payload: std::result::Result<Json<RestoreRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
     let Json(request) = payload.map_err(ApiError::from_json_rejection)?;
+    if !state.font_configured {
+        let target = state
+            .store
+            .load_revision_json(&project_id, request.target_revision)?;
+        let target: Value = serde_json::from_str(&target)
+            .map_err(|error| ApiError::internal(&format!("Stored timeline is invalid: {error}")))?;
+        if timeline_document_has_text(&target) {
+            return Err(ApiError::from_anyhow(
+                StudioError::new(
+                    "FONT_REQUIRED",
+                    "this revision contains text clips; restart the API with --font <font-file>",
+                )
+                .with_pointer("/targetRevision")
+                .into(),
+            ));
+        }
+    }
     let store = state.store;
     let workspace = state.workspace;
     let conflict_project_id = project_id.clone();
@@ -615,7 +799,7 @@ async fn restore_project_revision(
         }
         Err(error) => {
             let mut api_error = ApiError::from_anyhow(error);
-            api_error.current_revision = current_revision;
+            api_error.set_current_revision(current_revision);
             Err(api_error)
         }
     }
@@ -630,13 +814,15 @@ async fn apply_operations(
     let store = state.store;
     let workspace = state.workspace;
     let project_id_for_conflict = project_id.clone();
+    let font_configured = state.font_configured;
     let (result, current_revision) = tokio::task::spawn_blocking(move || {
-        let result = store.apply_edit_batch(
+        let result = store.apply_edit_batch_with(
             &workspace,
             &project_id,
             request.expected_revision,
             &request.idempotency_key,
             &request.operations,
+            font_configured,
         );
         let current_revision = result
             .as_ref()
@@ -657,7 +843,7 @@ async fn apply_operations(
         Ok(result) => Ok(Json(result)),
         Err(error) => {
             let mut api_error = ApiError::from_anyhow(error);
-            api_error.current_revision = current_revision;
+            api_error.set_current_revision(current_revision);
             Err(api_error)
         }
     }
@@ -669,6 +855,23 @@ async fn enqueue_render(
     payload: std::result::Result<Json<RenderRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ApiError> {
     let Json(request) = payload.map_err(ApiError::from_json_rejection)?;
+    if !state.font_configured {
+        let timeline = state
+            .store
+            .load_revision_json(&project_id, request.revision)?;
+        let timeline: Value = serde_json::from_str(&timeline)
+            .map_err(|error| ApiError::internal(&format!("Stored timeline is invalid: {error}")))?;
+        if timeline_document_has_text(&timeline) {
+            return Err(ApiError::from_anyhow(
+                StudioError::new(
+                    "FONT_REQUIRED",
+                    "this revision contains text clips; restart the API with --font <font-file>",
+                )
+                .with_pointer("/tracks")
+                .into(),
+            ));
+        }
+    }
     let submission = state.store.enqueue_render_job(
         &project_id,
         request.revision,
@@ -683,11 +886,109 @@ async fn enqueue_render(
     Ok((status, Json(submission)).into_response())
 }
 
+fn timeline_document_has_text(document: &Value) -> bool {
+    document
+        .get("tracks")
+        .and_then(Value::as_array)
+        .is_some_and(|tracks| {
+            tracks.iter().any(|track| {
+                track
+                    .get("clips")
+                    .and_then(Value::as_array)
+                    .is_some_and(|clips| {
+                        clips
+                            .iter()
+                            .any(|clip| clip.get("kind").and_then(Value::as_str) == Some("text"))
+                    })
+            })
+        })
+}
+
 async fn get_render_job(
     State(state): State<ApiState>,
     Path(job_id): Path<String>,
 ) -> std::result::Result<Json<RenderJob>, ApiError> {
     Ok(Json(state.store.get_render_job(&job_id)?))
+}
+
+async fn inspect_render_job(
+    State(state): State<ApiState>,
+    Path(job_id): Path<String>,
+) -> std::result::Result<Json<Inspection>, ApiError> {
+    let job = state.store.get_render_job(&job_id)?;
+    let timeline = state
+        .store
+        .load_revision_json(&job.project_id, job.revision)
+        .ok()
+        .and_then(|document| serde_json::from_str::<Timeline>(&document).ok());
+    let output = if job.status == crate::RenderJobStatus::Succeeded {
+        Workspace::open(&state.workspace)
+            .and_then(|workspace| workspace.resolve_render_output(&job.job_id, job.attempt))
+            .ok()
+    } else {
+        None
+    };
+    let ffmpeg = state.ffmpeg.clone();
+    let inspection = tokio::task::spawn_blocking(move || {
+        inspect_job(&job, timeline.as_ref(), output.as_deref(), &ffmpeg)
+    })
+    .await
+    .map_err(|_| ApiError::internal("The output inspection did not complete"))??;
+    Ok(Json(inspection))
+}
+
+async fn get_render_still(
+    State(state): State<ApiState>,
+    Path((job_id, frame)): Path<(String, u64)>,
+) -> std::result::Result<Response, ApiError> {
+    let job = state.store.get_render_job(&job_id)?;
+    if job.status != crate::RenderJobStatus::Succeeded {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "JOB_NOT_SUCCEEDED",
+            "still frames are available only after a successful render",
+        ));
+    }
+    let workspace = Workspace::open(&state.workspace)?;
+    let output = workspace.resolve_render_output(&job.job_id, job.attempt)?;
+    let timeline = state
+        .store
+        .load_revision_json(&job.project_id, job.revision)
+        .ok()
+        .and_then(|document| serde_json::from_str::<Timeline>(&document).ok());
+    let ffmpeg = state.ffmpeg.clone();
+    let job_for_still = job.clone();
+    let output_for_still = output.clone();
+    let path = tokio::task::spawn_blocking(move || {
+        ensure_still(
+            &job_for_still,
+            timeline.as_ref(),
+            &output_for_still,
+            &ffmpeg,
+            frame,
+        )
+    })
+    .await
+    .map_err(|_| ApiError::internal("Still extraction did not complete"))??;
+    let metadata = tokio::fs::metadata(&path).await.map_err(|_| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "STILL_NOT_FOUND",
+            "still frame was not generated",
+        )
+    })?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| ApiError::internal("Could not open generated still frame"))?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "image/jpeg")
+        .header(CONTENT_LENGTH, metadata.len())
+        .header(CACHE_CONTROL, "private, max-age=3600")
+        .body(body)
+        .map_err(|_| ApiError::internal("Could not prepare still-frame response"))
 }
 
 async fn cancel_render_job(
@@ -1131,6 +1432,11 @@ fn media_mime_type(kind: AssetKind, file_name: Option<&str>, format_name: &str) 
         .unwrap_or("")
         .to_ascii_lowercase();
     let mime_type = match (kind, extension.as_str()) {
+        (AssetKind::Image, "jpg" | "jpeg") => "image/jpeg",
+        (AssetKind::Image, "png") => "image/png",
+        (AssetKind::Image, "bmp") => "image/bmp",
+        (AssetKind::Image, "webp") => "image/webp",
+        (AssetKind::Image, "tif" | "tiff") => "image/tiff",
         (AssetKind::Video, "mp4" | "m4v") => "video/mp4",
         (AssetKind::Video, "mov") => "video/quicktime",
         (AssetKind::Video, "mkv") => "video/x-matroska",
@@ -1140,6 +1446,11 @@ fn media_mime_type(kind: AssetKind, file_name: Option<&str>, format_name: &str) 
         (AssetKind::Audio, "m4a") => "audio/mp4",
         (AssetKind::Video, _) if format_name.contains("matroska") => "video/x-matroska",
         (AssetKind::Video, _) => "video/mp4",
+        (AssetKind::Image, _) if format_name.contains("jpeg") => "image/jpeg",
+        (AssetKind::Image, _) if format_name.contains("bmp") => "image/bmp",
+        (AssetKind::Image, _) if format_name.contains("webp") => "image/webp",
+        (AssetKind::Image, _) if format_name.contains("tiff") => "image/tiff",
+        (AssetKind::Image, _) => "image/png",
         (AssetKind::Audio, _) if format_name.contains("wav") => "audio/wav",
         (AssetKind::Audio, _) if format_name.contains("mp3") => "audio/mpeg",
         (AssetKind::Audio, _) => "audio/mp4",
@@ -1299,6 +1610,8 @@ mod tests {
 
     const PROJECT_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0a";
     const ASSET_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0b";
+    const AUDIO_ASSET_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0c";
+    const IMAGE_ASSET_ID: &str = "018f2e40-4d28-7e31-8b63-611d49c43b0d";
     const TEST_TOKEN: &str = "local-test-token-0123456789abcdef012345";
 
     #[tokio::test]
@@ -1318,6 +1631,417 @@ mod tests {
         let response = request(&app, Method::GET, "/v1/health", Some(TEST_TOKEN), None).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response_json(response).await["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn agent_contract_bootstraps_assets_and_applies_seconds_based_edits() {
+        let root = tempdir().unwrap();
+        let workspace_path = root.path().join("workspace");
+        let workspace = Workspace::open(&workspace_path).unwrap();
+        install_video_fixture(&workspace, root.path());
+        install_audio_fixture(&workspace, root.path());
+        install_image_fixture(&workspace, root.path());
+        let store = ProjectStore::open(root.path().join("projects.sqlite")).unwrap();
+        let app = build_router(
+            store.clone(),
+            workspace_path.clone(),
+            "missing-ffprobe".into(),
+            TEST_TOKEN.to_owned(),
+            JobCancellationRegistry::default(),
+        );
+
+        let capabilities = request(
+            &app,
+            Method::GET,
+            "/v1/capabilities",
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(capabilities.status(), StatusCode::OK);
+        let capabilities: Value = response_json(capabilities).await;
+        assert_eq!(capabilities["schemaVersion"], "1.0.0");
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| operation["type"] == "clip.append")
+        );
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| operation["type"] == "image.add")
+        );
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| operation["type"] == "image.motion.set")
+        );
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| operation["type"] == "clip.transition.set")
+        );
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| operation["type"] == "clip.transition.remove")
+        );
+        assert!(
+            capabilities["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| operation["type"] == "audio.fade.set")
+        );
+        assert_eq!(capabilities["timelineSchemaUrl"], "/v1/schemas/timeline");
+        for path in ["/v1/schemas/timeline", "/v1/openapi.json"] {
+            let response = request(&app, Method::GET, path, Some(TEST_TOKEN), None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+
+        let image_metadata = request(
+            &app,
+            Method::GET,
+            &format!("/v1/assets/{IMAGE_ASSET_ID}"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(image_metadata.status(), StatusCode::OK);
+        let image_metadata: Value = response_json(image_metadata).await;
+        assert_eq!(image_metadata["kind"], "image");
+        assert_eq!(image_metadata["mimeType"], "image/png");
+
+        let created = request(
+            &app,
+            Method::POST,
+            "/v1/projects",
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "assetIds": [ASSET_ID],
+                    "presetId": "landscape_720p30",
+                    "name": "Agent campaign"
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created: Value = response_json(created).await;
+        assert_eq!(created["revision"], 1);
+        assert_eq!(created["name"], "Agent campaign");
+        let project_id = created["projectId"].as_str().unwrap();
+        let opening_timeline = request(
+            &app,
+            Method::GET,
+            &format!("/v1/projects/{project_id}/timeline"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        let opening_timeline: Value = response_json(opening_timeline).await;
+        let opening_clip_id = opening_timeline["tracks"][0]["clips"][0]["id"]
+            .as_str()
+            .unwrap();
+
+        let operations = json!({
+            "expectedRevision": 1,
+            "idempotencyKey": "seconds-agent-batch",
+            "operations": [
+                {
+                    "type": "clip.append",
+                    "assetId": ASSET_ID,
+                    "sourceInSeconds": 0.25,
+                    "durationSeconds": 0.5
+                },
+                {
+                    "type": "clip.crop",
+                    "clipId": opening_clip_id,
+                    "crop": {"x": 0.25, "y": 0, "width": 0.5, "height": 1}
+                },
+                {
+                    "type": "image.add",
+                    "assetId": IMAGE_ASSET_ID,
+                    "durationSeconds": 2
+                },
+                {
+                    "type": "audio.add",
+                    "assetId": AUDIO_ASSET_ID,
+                    "startSeconds": 0.25,
+                    "durationSeconds": 0.5,
+                    "gain": 0.7
+                },
+                {
+                    "type": "title.add",
+                    "text": "Agent-first editing",
+                    "startSeconds": 0.5,
+                    "durationSeconds": 0.5
+                }
+            ]
+        });
+        let edited = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/operations"),
+            Some(TEST_TOKEN),
+            Some(operations.to_string()),
+        )
+        .await;
+        assert_eq!(edited.status(), StatusCode::OK);
+        assert_eq!(response_json(edited).await["revision"], 2);
+
+        let timeline = request(
+            &app,
+            Method::GET,
+            &format!("/v1/projects/{project_id}/timeline"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        let timeline: Value = response_json(timeline).await;
+        let crop = &timeline["tracks"][0]["clips"][0]["crop"];
+        assert_eq!(crop["x"].as_f64(), Some(0.25));
+        assert_eq!(crop["y"].as_f64(), Some(0.0));
+        assert_eq!(crop["width"].as_f64(), Some(0.5));
+        assert_eq!(crop["height"].as_f64(), Some(1.0));
+        let appended = &timeline["tracks"][0]["clips"][1];
+        assert_eq!(appended["durationFrames"], 15);
+        assert_eq!(appended["sourceIn"]["ticks"], 250_000);
+        assert_eq!(appended["sourceOut"]["ticks"], 750_000);
+        let image = &timeline["tracks"][0]["clips"][2];
+        assert_eq!(image["kind"], "image");
+        assert_eq!(image["assetId"], IMAGE_ASSET_ID);
+        assert_eq!(image["durationFrames"], 60);
+        assert_eq!(image["motion"], "static");
+        let image_clip_id = image["id"].as_str().unwrap();
+        let motion_update = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/operations"),
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "expectedRevision": 2,
+                    "idempotencyKey": "image-motion-preset",
+                    "operations": [{
+                        "type": "image.motion.set",
+                        "clipId": image_clip_id,
+                        "motion": "zoom_in"
+                    }]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(motion_update.status(), StatusCode::OK);
+        assert_eq!(response_json(motion_update).await["revision"], 3);
+        let timeline = request(
+            &app,
+            Method::GET,
+            &format!("/v1/projects/{project_id}/timeline"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        let timeline: Value = response_json(timeline).await;
+        assert_eq!(timeline["tracks"][0]["clips"][2]["motion"], "zoom_in");
+        let video_motion = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/operations"),
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "expectedRevision": 3,
+                    "idempotencyKey": "motion-rejects-video",
+                    "operations": [{
+                        "type": "image.motion.set",
+                        "clipId": opening_clip_id,
+                        "motion": "pan_left"
+                    }]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(video_motion.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let crossfade = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/operations"),
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "expectedRevision": 3,
+                    "idempotencyKey": "set-image-crossfade",
+                    "operations": [{
+                        "type": "clip.transition.set",
+                        "clipId": image_clip_id,
+                        "durationFrames": 12
+                    }]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(crossfade.status(), StatusCode::OK);
+        assert_eq!(response_json(crossfade).await["revision"], 4);
+        let timeline = request(
+            &app,
+            Method::GET,
+            &format!("/v1/projects/{project_id}/timeline"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        let timeline: Value = response_json(timeline).await;
+        assert_eq!(timeline["tracks"][0]["clips"][2]["startFrame"], 33);
+        assert_eq!(
+            timeline["tracks"][0]["clips"][2]["transitionIn"]["type"],
+            "crossfade"
+        );
+        assert_eq!(
+            timeline["tracks"][0]["clips"][2]["transitionIn"]["durationFrames"],
+            12
+        );
+        let audio = &timeline["tracks"][1]["clips"][0];
+        assert_eq!(audio["startFrame"], 8);
+        assert_eq!(audio["durationFrames"], 15);
+        let audio_clip_id = audio["id"].as_str().unwrap();
+        let audio_fade = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/operations"),
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "expectedRevision": 4,
+                    "idempotencyKey": "set-audio-fades",
+                    "operations": [{
+                        "type": "audio.fade.set",
+                        "clipId": audio_clip_id,
+                        "fadeInFrames": 5,
+                        "fadeOutFrames": 5
+                    }]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(audio_fade.status(), StatusCode::OK);
+        assert_eq!(response_json(audio_fade).await["revision"], 5);
+        let timeline = request(
+            &app,
+            Method::GET,
+            &format!("/v1/projects/{project_id}/timeline"),
+            Some(TEST_TOKEN),
+            None,
+        )
+        .await;
+        let timeline: Value = response_json(timeline).await;
+        assert_eq!(timeline["tracks"][1]["clips"][0]["fadeInFrames"], 5);
+        assert_eq!(timeline["tracks"][1]["clips"][0]["fadeOutFrames"], 5);
+        let title = &timeline["tracks"][3]["clips"][0];
+        assert_eq!(title["startFrame"], 15);
+        assert_eq!(title["durationFrames"], 15);
+
+        let invalid_crop = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/operations"),
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "expectedRevision": 5,
+                    "idempotencyKey": "invalid-crop-rectangle",
+                    "operations": [{
+                        "type": "clip.crop",
+                        "clipId": opening_clip_id,
+                        "crop": {"x": 0.75, "y": 0, "width": 0.5, "height": 1}
+                    }]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(invalid_crop.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let invalid_crop: Value = response_json(invalid_crop).await;
+        assert_eq!(invalid_crop["error"]["code"], "VALIDATION_FAILED");
+        assert_eq!(invalid_crop["error"]["details"]["pointer"], "/crop");
+
+        let stale = request(
+            &app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/operations"),
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "expectedRevision": 1,
+                    "idempotencyKey": "stale-agent-edit",
+                    "operations": [{"type": "clip.remove", "clipId": "not-present"}]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale: Value = response_json(stale).await;
+        assert_eq!(stale["error"]["code"], "REVISION_CONFLICT");
+        assert_eq!(stale["error"]["details"]["currentRevision"], 5);
+        assert_eq!(stale["error"]["details"]["expected"], "1");
+        assert_eq!(stale["error"]["details"]["actual"], "5");
+
+        let no_font_app = build_router_with_config(
+            store.clone(),
+            workspace_path,
+            "missing-ffprobe".into(),
+            "missing-ffmpeg".into(),
+            false,
+            TEST_TOKEN.to_owned(),
+            JobCancellationRegistry::default(),
+        );
+        let no_font = request(
+            &no_font_app,
+            Method::POST,
+            &format!("/v1/projects/{project_id}/operations"),
+            Some(TEST_TOKEN),
+            Some(
+                json!({
+                    "expectedRevision": 5,
+                    "idempotencyKey": "font-required-title",
+                    "operations": [{
+                        "type": "title.add",
+                        "text": "Needs a font",
+                        "startSeconds": 0,
+                        "durationSeconds": 0.25
+                    }]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(no_font.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let no_font: Value = response_json(no_font).await;
+        assert_eq!(no_font["error"]["code"], "FONT_REQUIRED");
+        assert_eq!(
+            store
+                .get_project_summary(project_id)
+                .unwrap()
+                .current_revision,
+            5
+        );
     }
 
     #[tokio::test]
@@ -2568,6 +3292,7 @@ mod tests {
                 duration_seconds: 1.0,
                 has_video: true,
                 has_audio: false,
+                has_still_image: false,
                 video: Some(StreamInfo {
                     codec: "h264".to_owned(),
                     duration_seconds: Some(1.0),
@@ -2586,6 +3311,84 @@ mod tests {
         )
         .unwrap();
         assert!(workspace.load_asset(ASSET_ID).is_ok());
+    }
+
+    fn install_audio_fixture(workspace: &Workspace, root: &Path) {
+        let source = b"fixture audio bytes";
+        let directory = root.join("workspace").join("assets").join(AUDIO_ASSET_ID);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(SOURCE_FILENAME), source).unwrap();
+        let manifest = AssetManifest {
+            schema_version: 1,
+            asset_id: AUDIO_ASSET_ID.to_owned(),
+            sha256: hex::encode(Sha256::digest(source)),
+            bytes: source.len() as u64,
+            kind: AssetKind::Audio,
+            file_name: Some("fixture.wav".to_owned()),
+            probe: MediaProbe {
+                format_name: "wav".to_owned(),
+                duration: "1.0".to_owned(),
+                duration_seconds: 1.0,
+                has_video: false,
+                has_audio: true,
+                has_still_image: false,
+                video: None,
+                audio: Some(StreamInfo {
+                    codec: "pcm_s16le".to_owned(),
+                    duration_seconds: Some(1.0),
+                    frame_rate: None,
+                    width: None,
+                    height: None,
+                    sample_rate: Some(48_000),
+                    channels: Some(2),
+                }),
+            },
+        };
+        fs::write(
+            directory.join("asset.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(workspace.load_asset(AUDIO_ASSET_ID).is_ok());
+    }
+
+    fn install_image_fixture(workspace: &Workspace, root: &Path) {
+        let source = b"fixture PNG bytes";
+        let directory = root.join("workspace").join("assets").join(IMAGE_ASSET_ID);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(SOURCE_FILENAME), source).unwrap();
+        let manifest = AssetManifest {
+            schema_version: 1,
+            asset_id: IMAGE_ASSET_ID.to_owned(),
+            sha256: hex::encode(Sha256::digest(source)),
+            bytes: source.len() as u64,
+            kind: AssetKind::Image,
+            file_name: Some("fixture.png".to_owned()),
+            probe: MediaProbe {
+                format_name: "png_pipe".to_owned(),
+                duration: "0".to_owned(),
+                duration_seconds: 0.0,
+                has_video: false,
+                has_audio: false,
+                has_still_image: true,
+                video: Some(StreamInfo {
+                    codec: "png".to_owned(),
+                    duration_seconds: None,
+                    frame_rate: Some("25/1".to_owned()),
+                    width: Some(320),
+                    height: Some(240),
+                    sample_rate: None,
+                    channels: None,
+                }),
+                audio: None,
+            },
+        };
+        fs::write(
+            directory.join("asset.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(workspace.load_asset(IMAGE_ASSET_ID).is_ok());
     }
 
     fn timeline_for_uploaded_asset(asset_id: &str, sha256: &str) -> Value {

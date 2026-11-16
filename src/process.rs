@@ -1,7 +1,10 @@
 use std::{
-    io::{self, Read},
+    io::{self, BufRead, BufReader, Read},
     process::{Command, ExitStatus, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -29,6 +32,15 @@ pub fn run_bounded_cancellable(
     timeout: Duration,
     cancellation: Option<&AtomicBool>,
 ) -> Result<CapturedOutput> {
+    run_bounded_cancellable_inner(command, timeout, cancellation, None)
+}
+
+fn run_bounded_cancellable_inner(
+    command: &mut Command,
+    timeout: Duration,
+    cancellation: Option<&AtomicBool>,
+    on_progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+) -> Result<CapturedOutput> {
     let mut child: GroupChild = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -45,7 +57,10 @@ pub fn run_bounded_cancellable(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("could not capture media tool stderr"))?;
-    let stdout_reader = thread::spawn(move || drain_capped(stdout, MAX_STDOUT_CAPTURE));
+    let stdout_reader = thread::spawn(move || match on_progress {
+        Some(callback) => drain_progress(stdout, MAX_STDOUT_CAPTURE, callback),
+        None => drain_capped(stdout, MAX_STDOUT_CAPTURE),
+    });
     let stderr_reader = thread::spawn(move || drain_capped(stderr, MAX_STDERR_CAPTURE));
 
     let start = Instant::now();
@@ -87,6 +102,22 @@ pub fn run_bounded_cancellable(
     })
 }
 
+pub(crate) fn run_checked_cancellable_with_progress(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+    cancellation: Option<&AtomicBool>,
+    on_progress: Arc<dyn Fn(u64) + Send + Sync>,
+) -> Result<CapturedOutput> {
+    let output = run_bounded_cancellable_inner(command, timeout, cancellation, Some(on_progress))
+        .with_context(|| format!("{label} failed"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{label} exited with {}: {}", output.status, stderr.trim());
+    }
+    Ok(output)
+}
+
 pub fn run_checked_cancellable(
     command: &mut Command,
     timeout: Duration,
@@ -116,10 +147,56 @@ fn drain_capped(mut reader: impl Read, cap: usize) -> io::Result<Vec<u8>> {
     Ok(captured)
 }
 
+fn drain_progress(
+    reader: impl Read,
+    cap: usize,
+    on_progress: Arc<dyn Fn(u64) + Send + Sync>,
+) -> io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(reader);
+    let mut captured = Vec::with_capacity(cap.min(16 * 1024));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = cap.saturating_sub(captured.len());
+        captured.extend_from_slice(&line[..read.min(remaining)]);
+
+        if let Some(frame) = line
+            .strip_prefix(b"frame=")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            on_progress(frame);
+        }
+    }
+    Ok(captured)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    #[test]
+    fn progress_reader_reports_frames_and_preserves_output() {
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&progress);
+        let input = b"frame=12\nout_time_us=500000\nprogress=continue\nframe=24\nprogress=end\n";
+        let output = drain_progress(
+            &input[..],
+            1024,
+            Arc::new(move |frame| {
+                observed.lock().unwrap().push(frame);
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(output, input);
+        assert_eq!(*progress.lock().unwrap(), [12, 24]);
+    }
 
     #[test]
     fn run_bounded_kills_a_process_after_its_deadline() {

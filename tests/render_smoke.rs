@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde_json::json;
-use studio::{ImportOptions, RenderOptions, import_asset, render_timeline};
+use studio::{ImportOptions, ProjectStore, RenderOptions, import_asset, render_timeline};
 use tempfile::tempdir;
 
 #[test]
@@ -116,7 +116,7 @@ fn imports_validates_and_renders_a_small_timeline() {
         }));
     }
 
-    let timeline = json!({
+    let mut timeline = json!({
         "schemaVersion": "1.0.0",
         "projectId": "018f2e40-4d28-7e31-8b63-611d49c43b0a",
         "revision": 0,
@@ -129,6 +129,8 @@ fn imports_validates_and_renders_a_small_timeline() {
         "tracks": tracks,
         "settings": {"audioSampleRate": 48000, "colorSpace": "rec709"}
     });
+    timeline["tracks"][0]["clips"][0]["crop"] =
+        json!({"x": 0.25, "y": 0.1, "width": 0.5, "height": 0.8});
     let timeline_path = root.path().join("timeline.json");
     fs::write(
         &timeline_path,
@@ -316,6 +318,84 @@ fn imports_validates_and_renders_a_small_timeline() {
     assert_eq!(silent_result.output_frame_count, 24);
     assert!((silent_result.output_duration_seconds - 1.0).abs() <= 1.0 / 24.0);
 
+    let mut crossfade_timeline = silent_timeline.clone();
+    crossfade_timeline["assets"][&imported_b.asset_id] = asset_ref(&imported_b);
+    let mut incoming = video_clip("incoming", &imported_b.asset_id, 12);
+    incoming["transitionIn"] = json!({"type": "crossfade", "durationFrames": 12});
+    crossfade_timeline["tracks"][0]["clips"]
+        .as_array_mut()
+        .unwrap()
+        .push(incoming);
+    let crossfade_timeline_path = root.path().join("crossfade-timeline.json");
+    fs::write(
+        &crossfade_timeline_path,
+        serde_json::to_vec_pretty(&crossfade_timeline).unwrap(),
+    )
+    .unwrap();
+    let crossfade_output = root.path().join("crossfade.mp4");
+    let crossfade_result = render_timeline(RenderOptions {
+        workspace: workspace.clone(),
+        timeline: crossfade_timeline_path,
+        output: crossfade_output.clone(),
+        ffmpeg: ffmpeg.clone(),
+        ffprobe: ffprobe.clone(),
+        font: None,
+        timeout_seconds: 120,
+    })
+    .unwrap();
+    assert_eq!(crossfade_result.output_frame_count, 36);
+    assert!((crossfade_result.output_duration_seconds - 1.5).abs() <= 1.0 / 24.0);
+    let midpoint = decode_frame(&ffmpeg, &crossfade_output, 18);
+    let center = (180 * 640 + 320) * 3;
+    assert!(midpoint[center] > 50 && midpoint[center + 2] > 50);
+
+    let fade_timeline = json!({
+        "schemaVersion": "1.0.0",
+        "projectId": "018f2e40-4d28-7e31-8b63-611d49c43b0a",
+        "revision": 0,
+        "canvas": {"width": 640, "height": 360, "fps": {"num": 24, "den": 1}, "background": "#101820"},
+        "assets": {
+            imported_a.asset_id.clone(): asset_ref(&imported_a),
+            imported_audio.asset_id.clone(): asset_ref(&imported_audio)
+        },
+        "tracks": [
+            {"id": "video-main", "kind": "video", "order": 0, "clips": [video_clip("fade-visual", &imported_a.asset_id, 0)]},
+            {"id": "music", "kind": "audio", "order": 1, "clips": [{
+                "id": "faded-audio", "kind": "audio", "assetId": imported_audio.asset_id,
+                "startFrame": 0, "durationFrames": 24,
+                "sourceIn": {"ticks": 0, "timebase_num": 1, "timebase_den": 48000},
+                "sourceOut": {"ticks": 48000, "timebase_num": 1, "timebase_den": 48000},
+                "gain": 0.7, "fadeInFrames": 12, "fadeOutFrames": 12
+            }]}
+        ],
+        "settings": {"audioSampleRate": 48000, "colorSpace": "rec709"}
+    });
+    let fade_timeline_path = root.path().join("fade-timeline.json");
+    fs::write(
+        &fade_timeline_path,
+        serde_json::to_vec_pretty(&fade_timeline).unwrap(),
+    )
+    .unwrap();
+    let fade_output = root.path().join("audio-fades.mp4");
+    let fade_result = render_timeline(RenderOptions {
+        workspace: workspace.clone(),
+        timeline: fade_timeline_path,
+        output: fade_output.clone(),
+        ffmpeg: ffmpeg.clone(),
+        ffprobe: ffprobe.clone(),
+        font: None,
+        timeout_seconds: 120,
+    })
+    .unwrap();
+    assert_eq!(fade_result.output_frame_count, 24);
+    let faded_samples = decode_audio(&ffmpeg, &fade_output);
+    assert!(faded_samples.len() >= 48_000);
+    let fade_in_rms = samples_rms(&faded_samples[..4_800]);
+    let middle_rms = samples_rms(&faded_samples[21_600..26_400]);
+    let fade_out_rms = samples_rms(&faded_samples[43_200..48_000]);
+    assert!(fade_in_rms < middle_rms * 0.25);
+    assert!(fade_out_rms < middle_rms * 0.25);
+
     let overwrite = render_timeline(RenderOptions {
         workspace,
         timeline: timeline_path,
@@ -329,6 +409,128 @@ fn imports_validates_and_renders_a_small_timeline() {
         overwrite.is_err(),
         "renderer must not overwrite an existing export"
     );
+}
+
+#[test]
+fn imports_bootstraps_crops_and_renders_still_images() {
+    let Some(ffmpeg) = configured_tool("STUDIO_TEST_FFMPEG", "ffmpeg") else {
+        eprintln!("skipping still-image integration test: ffmpeg not found");
+        return;
+    };
+    let Some(ffprobe) = configured_tool("STUDIO_TEST_FFPROBE", "ffprobe") else {
+        eprintln!("skipping still-image integration test: ffprobe not found");
+        return;
+    };
+
+    let root = tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let image_path = root.path().join("still.png");
+    run(
+        &ffmpeg,
+        [
+            "-hide_banner",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=magenta:s=320x240",
+            "-frames:v",
+            "1",
+            "-y",
+        ]
+        .into_iter()
+        .chain([image_path.to_str().unwrap()]),
+    );
+
+    let imported = import_asset(ImportOptions {
+        workspace: workspace.clone(),
+        file: image_path,
+        ffprobe: ffprobe.clone(),
+    })
+    .unwrap();
+    assert_eq!(imported.kind, studio::AssetKind::Image);
+    assert!(imported.probe.has_still_image);
+    assert!(!imported.probe.has_video);
+    assert_eq!(imported.probe.video.as_ref().unwrap().width, Some(320));
+
+    let store = ProjectStore::open(root.path().join("projects.sqlite")).unwrap();
+    let created = store
+        .create_from_asset_ids(
+            &workspace,
+            std::slice::from_ref(&imported.asset_id),
+            None,
+            None,
+        )
+        .unwrap();
+    let (_, timeline_json) = store
+        .load_current_revision_json(&created.project_id)
+        .unwrap();
+    let timeline: serde_json::Value = serde_json::from_str(&timeline_json).unwrap();
+    assert_eq!(timeline["tracks"][0]["clips"][0]["kind"], "image");
+    assert_eq!(timeline["tracks"][0]["clips"][0]["durationFrames"], 150);
+    let image_clip_id = timeline["tracks"][0]["clips"][0]["id"].as_str().unwrap();
+
+    let image_add = serde_json::from_value(json!({
+        "type": "image.add",
+        "assetId": imported.asset_id,
+        "durationSeconds": 2.0
+    }))
+    .unwrap();
+    let crop = serde_json::from_value(json!({
+        "type": "clip.crop",
+        "clipId": image_clip_id,
+        "crop": {"x": 0.25, "y": 0.1, "width": 0.5, "height": 0.8}
+    }))
+    .unwrap();
+    let trim = serde_json::from_value(json!({
+        "type": "clip.trim",
+        "clipId": image_clip_id,
+        "startFrame": 0,
+        "durationFrames": 180
+    }))
+    .unwrap();
+    let motion = serde_json::from_value(json!({
+        "type": "image.motion.set",
+        "clipId": image_clip_id,
+        "motion": "pan_right"
+    }))
+    .unwrap();
+    store
+        .apply_edit_batch(
+            &workspace,
+            &created.project_id,
+            1,
+            "append-crop-and-motion-image",
+            &[image_add, crop, trim, motion],
+        )
+        .unwrap();
+    let (_, timeline_json) = store
+        .load_current_revision_json(&created.project_id)
+        .unwrap();
+    let edited_timeline: serde_json::Value = serde_json::from_str(&timeline_json).unwrap();
+    assert_eq!(
+        edited_timeline["tracks"][0]["clips"][0]["motion"],
+        "pan_right"
+    );
+    let timeline_path = root.path().join("still-image-timeline.json");
+    fs::write(&timeline_path, timeline_json).unwrap();
+
+    let output = root.path().join("still-image-render.mp4");
+    let result = render_timeline(RenderOptions {
+        workspace,
+        timeline: timeline_path,
+        output: output.clone(),
+        ffmpeg,
+        ffprobe,
+        font: None,
+        timeout_seconds: 120,
+    })
+    .unwrap();
+    assert!(output.is_file());
+    assert_eq!((result.output_width, result.output_height), (320, 240));
+    assert_eq!(result.output_frame_count, 240);
+    assert_eq!(result.output_frame_rate, "30/1");
 }
 
 #[test]
@@ -460,6 +662,63 @@ fn make_video(ffmpeg: &Path, output: &Path, color: &str) {
 fn run<'a>(ffmpeg: &Path, args: impl IntoIterator<Item = &'a str>) {
     let status = Command::new(ffmpeg).args(args).status().unwrap();
     assert!(status.success(), "fixture ffmpeg process failed: {status}");
+}
+
+fn decode_frame(ffmpeg: &Path, video: &Path, frame: u32) -> Vec<u8> {
+    let selection = format!("select=eq(n\\,{frame})");
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-v", "error", "-i"])
+        .arg(video)
+        .args([
+            "-vf",
+            &selection,
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "could not decode crossfade frame");
+    output.stdout
+}
+
+fn decode_audio(ffmpeg: &Path, video: &Path) -> Vec<i16> {
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-v", "error", "-i"])
+        .arg(video)
+        .args([
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-acodec",
+            "pcm_s16le",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "could not decode faded audio");
+    output
+        .stdout
+        .chunks_exact(2)
+        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+        .collect()
+}
+
+fn samples_rms(samples: &[i16]) -> f64 {
+    let energy = samples
+        .iter()
+        .map(|sample| f64::from(*sample).powi(2))
+        .sum::<f64>();
+    (energy / samples.len() as f64).sqrt()
 }
 
 fn configured_tool(variable: &str, fallback: &str) -> Option<PathBuf> {

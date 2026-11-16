@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use studio::{
-    ApiServerOptions, ImportOptions, ProjectStore, RenderOptions, RenderRevisionOptions,
-    import_asset, read_edit_request, render_revision, render_timeline, serve_api,
+    ApiServerOptions, ImportOptions, McpOptions, ProjectStore, RenderOptions,
+    RenderRevisionOptions, import_asset, read_edit_request, render_revision, render_timeline,
+    serve_api, serve_mcp,
 };
 
 #[derive(Debug, Parser)]
@@ -17,7 +18,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Probe and safely stage a local video or audio file in a workspace.
+    /// Probe and safely stage a local video, audio, or still-image file in a workspace.
     Import {
         #[arg(long)]
         workspace: PathBuf,
@@ -41,7 +42,7 @@ enum Command {
         /// Required when the timeline contains text clips.
         #[arg(long)]
         font: Option<PathBuf>,
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 1800)]
         timeout_seconds: u64,
     },
     /// Create a revisioned project from an imported-media timeline.
@@ -82,13 +83,18 @@ enum Command {
         ffprobe: PathBuf,
         #[arg(long)]
         font: Option<PathBuf>,
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 1800)]
         timeout_seconds: u64,
     },
     /// Run the authenticated loopback REST API.
     Api {
         #[command(subcommand)]
         command: ApiCommand,
+    },
+    /// Run the agent tools over stdio using the Model Context Protocol.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
 }
 
@@ -122,7 +128,27 @@ enum ApiCommand {
         /// Required when stored timelines contain text clips.
         #[arg(long)]
         font: Option<PathBuf>,
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 1800)]
+        timeout_seconds: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Start the local stdio MCP server.
+    Serve {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long, default_value = "ffmpeg")]
+        ffmpeg: PathBuf,
+        #[arg(long, default_value = "ffprobe")]
+        ffprobe: PathBuf,
+        /// Required to edit or render projects containing titles.
+        #[arg(long)]
+        font: Option<PathBuf>,
+        #[arg(long, default_value_t = 1800)]
         timeout_seconds: u64,
     },
 }
@@ -242,6 +268,29 @@ async fn main() -> Result<()> {
                 timeout_seconds,
             })
             .await?;
+        }
+        Command::Mcp {
+            command:
+                McpCommand::Serve {
+                    database,
+                    workspace,
+                    ffmpeg,
+                    ffprobe,
+                    font,
+                    timeout_seconds,
+                },
+        } => {
+            tokio::task::spawn_blocking(move || {
+                serve_mcp(McpOptions {
+                    database,
+                    workspace,
+                    ffmpeg,
+                    ffprobe,
+                    font,
+                    timeout_seconds,
+                })
+            })
+            .await??;
         }
     }
     Ok(())
